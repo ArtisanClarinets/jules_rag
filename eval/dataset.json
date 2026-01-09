@@ -1,0 +1,14 @@
+[
+    {
+        "query": "Where is the configuration loaded?",
+        "expected_files": ["code_intelligence/config.py"]
+    },
+    {
+        "query": "How is the database initialized?",
+        "expected_files": ["code_intelligence/db.py"]
+    },
+    {
+        "query": "What does the retrieval engine do?",
+        "expected_files": ["code_intelligence/retrieval.py"]
+    }
+]
