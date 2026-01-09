@@ -1,0 +1,60 @@
+{
+  "name": "advanced-code-intelligence",
+  "displayName": "Advanced Code Intelligence RAG",
+  "version": "1.0.0",
+  "description": "Self-optimizing, multi-layered RAG system for VS Code",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onChatParticipant:code-council",
+    "onCommand:code-intelligence.index"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Code Council",
+      "properties": {
+        "codeCouncil.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Base URL for the local Code Council API server (python api/server.py)."
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "code-council",
+        "name": "Code Council",
+        "fullName": "Advanced Code Intelligence Council",
+        "description": "AI council with deep codebase understanding"
+      }
+    ],
+    "commands": [
+      {
+        "command": "code-intelligence.index",
+        "title": "Code Intelligence: Index Workspace"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^18.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}

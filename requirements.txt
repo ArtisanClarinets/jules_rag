@@ -1,0 +1,6 @@
+tree-sitter
+tree-sitter-languages
+rank_bm25
+numpy
+openai
+pathspec
