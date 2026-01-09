@@ -1,177 +1,222 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import json
 import os
-import time
+import logging
+from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 
-from code_intelligence.agents import RetrievalOrchestrator, SemanticSearchAgent, SyntacticSearchAgent, GraphTraversalAgent
-from code_intelligence.judges import CouncilOfJudges
-from code_intelligence.meta_learning import PerformanceAnalyzer, SelfImprovementEngine
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
-# Global initialization to avoid reloading on every request
 from code_intelligence.db import Database
-from code_intelligence.vector import VectorStore
-from code_intelligence.parser import ParserFactory
+from code_intelligence.indexing import FileIndexer
+from code_intelligence.retrieval import RetrievalEngine
+from code_intelligence.answer import AnswerEngine
+from code_intelligence.config import settings
 
+from pythonjsonlogger import jsonlogger
 
-def _load_gitignore(root: str):
-    default_ignores = {
-        ".git",
-        "node_modules",
-        "dist",
-        "build",
-        "out",
-        "__pycache__",
-        ".venv",
-        "venv",
-        ".pytest_cache",
-    }
-    gitignore_path = os.path.join(root, ".gitignore")
+# Logging Setup
+logger = logging.getLogger()
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(message)s %(request_id)s %(duration_ms)s')
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# State
+db: Optional[Database] = None
+indexer: Optional[FileIndexer] = None
+retriever: Optional[RetrievalEngine] = None
+answer_engine: Optional[AnswerEngine] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db, indexer, retriever, answer_engine
+    logger.info("Initializing Backend...")
+    db = Database(settings.db_path)
+    indexer = FileIndexer(db)
+    retriever = RetrievalEngine(db)
+    answer_engine = AnswerEngine()
+    yield
+    logger.info("Shutting down...")
+
+app = FastAPI(title="Code RAG API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Models ---
+
+class IndexRequest(BaseModel):
+    path: str
+    force: bool = False
+
+class QueryRequest(BaseModel):
+    query: str
+    k: int = 10
+    stream: bool = False
+
+class QueryResponse(BaseModel):
+    answer: str
+    citations: List[Dict[str, Any]]
+
+class SearchRequest(BaseModel):
+    query: str
+    k: int = 10
+
+class MCPCallRequest(BaseModel):
+    # Simplified MCP JSON-RPC wrapper
+    jsonrpc: str = "2.0"
+    method: str
+    params: Dict[str, Any] = {}
+    id: Optional[Any] = None
+
+# --- Middleware ---
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Local Token Auth
+    if settings.rag_api_token:
+        auth = request.headers.get("Authorization")
+        expected = f"Bearer {settings.rag_api_token.get_secret_value()}"
+        if auth != expected:
+             # Allow health check without auth? Usually yes.
+             if request.url.path != "/health":
+                 # Return JSON response for 401
+                 from fastapi.responses import JSONResponse
+                 return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    response = await call_next(request)
+    return response
+
+# --- Endpoints ---
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "provider": settings.llm_provider}
+
+@app.post("/index")
+async def trigger_indexing(req: IndexRequest, background_tasks: BackgroundTasks):
+    if not os.path.isdir(req.path):
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    background_tasks.add_task(run_indexing, req.path, req.force)
+    return {"status": "indexing_started", "path": req.path}
+
+def run_indexing(path: str, force: bool):
+    logger.info(f"Starting indexing for {path}")
     try:
-        from pathspec import PathSpec
-        from pathspec.patterns import GitWildMatchPattern
+        # FileIndexer.index_workspace now handles repo map generation and persistence
+        stats = indexer.index_workspace(path, force=force)
+        logger.info(f"Indexing complete: {stats}")
+    except Exception as e:
+        logger.error(f"Indexing failed: {e}")
 
-        patterns = []
-        if os.path.exists(gitignore_path):
-            with open(gitignore_path, "r", encoding="utf-8", errors="ignore") as f:
-                patterns = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+@app.post("/query", response_model=QueryResponse)
+async def query_codebase(req: QueryRequest):
+    if not retriever or not answer_engine:
+         raise HTTPException(status_code=503, detail="Not initialized")
 
-        spec = PathSpec.from_lines(GitWildMatchPattern, patterns)
+    logger.info(f"Query: {req.query}")
 
-        def is_ignored(path: str) -> bool:
-            rel = os.path.relpath(path, root)
-            parts = rel.split(os.sep)
-            if parts and parts[0] in default_ignores:
-                return True
-            return spec.match_file(rel)
+    # 1. Retrieve
+    results = retriever.retrieve(req.query, k=req.k)
 
-        return is_ignored
-    except Exception:
-        def is_ignored(path: str) -> bool:
-            rel = os.path.relpath(path, root)
-            parts = rel.split(os.sep)
-            return bool(parts and parts[0] in default_ignores)
+    # 2. Answer
+    output = answer_engine.answer(req.query, results)
 
-        return is_ignored
-
-
-def index_codebase(path: str, db: Database):
-    is_ignored = _load_gitignore(path)
-    max_bytes = int(os.getenv("MAX_INDEX_FILE_BYTES", "2000000"))
-    parsed = 0
-    for root, _, files in os.walk(path):
-        for file in files:
-            full_path = os.path.join(root, file)
-            if is_ignored(full_path):
-                continue
-            try:
-                if os.path.getsize(full_path) > max_bytes:
-                    continue
-            except OSError:
-                continue
-            parser = ParserFactory.get_parser(full_path, db)
-            if not parser:
-                continue
-            parser.parse_file(full_path)
-            parsed += 1
-    return parsed
-
-def build_engine():
-    """(Re)initialize DB + in-memory indexes."""
-
-    global db, vector_store, orchestrator
-    db = Database("codegraph.db")
-    vector_store = VectorStore()
-    orchestrator = RetrievalOrchestrator(
-        [
-            SemanticSearchAgent(db, vector_store),
-            SyntacticSearchAgent(db),
-            GraphTraversalAgent(db),
-        ]
+    return QueryResponse(
+        answer=output["answer"],
+        citations=output["citations"]
     )
 
+# --- MCP Support (Optional Mode) ---
+# This endpoint acts as a simple MCP server over HTTP.
+# Real MCP usually runs over Stdio or SSE, but HTTP is fine for tools.
 
-print("Initializing Code Intelligence Engine...")
-build_engine()
-print("Initialization Complete.")
+@app.post("/mcp")
+async def mcp_endpoint(req: MCPCallRequest):
+    if req.method == "rag.search":
+        q = req.params.get("query")
+        k = req.params.get("k", 5)
+        if not q:
+            return {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Missing query"}, "id": req.id}
 
-class RequestHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        start_time = time.time()
-        if self.path == '/query':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            data = json.loads(post_data)
-            query = data.get('query')
-            
-            results = orchestrator.execute(query)
-            
-            # Validate
-            council = CouncilOfJudges()
-            validation = council.validate(query, [r.__dict__ for r in results])
-            
-            # Meta-Learning Loop
-            latency = (time.time() - start_time) * 1000
-            analyzer = PerformanceAnalyzer()
-            analyzer.log_session(query, validation, latency)
-            
-            improver = SelfImprovementEngine()
-            optimization = improver.optimize()
+        results = retriever.retrieve(q, k=k)
+        return {
+            "jsonrpc": "2.0",
+            "result": {
+                "results": [
+                    {
+                        "content": r.node.content,
+                        "filepath": r.node.filepath,
+                        "lines": [r.node.start_line, r.node.end_line],
+                        "score": r.score
+                    } for r in results
+                ]
+            },
+            "id": req.id
+        }
 
-            response = {
-                "results": [r.__dict__ for r in results],
-                "validation": validation.__dict__ if hasattr(validation, '__dict__') else validation,
-                "meta_learning": optimization
-            }
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(response).encode())
-        elif self.path == '/index':
-            # Index a workspace. Body: {"path": "/absolute/or/relative"}
-            content_length = int(self.headers.get('Content-Length', '0') or '0')
-            post_data = self.rfile.read(content_length) if content_length else b"{}"
-            data = json.loads(post_data.decode('utf-8') or "{}")
-            path = data.get("path")
-            if not path:
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "Missing 'path'"}).encode())
-                return
+    elif req.method == "rag.explain":
+        # Simplified explain: just search and answer
+        symbol = req.params.get("symbol")
+        if not symbol:
+             return {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Missing symbol"}, "id": req.id}
 
-            try:
-                parsed = index_codebase(path, db)
-                # Rebuild in-memory indexes.
-                build_engine()
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "parsed_files": parsed}).encode())
-            except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+        # Reuse query logic
+        results = retriever.retrieve(f"Explain {symbol}", k=5)
+        output = answer_engine.answer(f"Explain the code symbol '{symbol}'", results)
 
-    def do_GET(self):
-        if self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": True}).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+        return {
+            "jsonrpc": "2.0",
+            "result": {
+                "explanation": output["answer"],
+                "citations": output["citations"]
+            },
+            "id": req.id
+        }
 
-def run(server_class=HTTPServer, handler_class=RequestHandler, port=8000):
-    server_address = ('', port)
-    httpd = server_class(server_address, handler_class)
-    print(f'Starting API server on port {port}...')
-    httpd.serve_forever()
+    elif req.method == "list_tools":
+        return {
+            "jsonrpc": "2.0",
+            "result": {
+                "tools": [
+                    {
+                        "name": "rag.search",
+                        "description": "Search the codebase for code snippets.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "k": {"type": "integer"}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "rag.explain",
+                        "description": "Explain a symbol or file.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "symbol": {"type": "string"}
+                            },
+                            "required": ["symbol"]
+                        }
+                    }
+                ]
+            },
+            "id": req.id
+        }
 
-if __name__ == '__main__':
-    run()
+    return {"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": req.id}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
