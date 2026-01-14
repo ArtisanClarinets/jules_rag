@@ -1,0 +1,232 @@
+{
+  "name": "RAG Code Assistant",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "chat-trigger",
+      "name": "When chat message received",
+      "type": "n8n-nodes-base.chatTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "rag-chat-webhook"
+    },
+    {
+      "parameters": {
+        "options": {
+          "systemMessage": "You are a helpful Code Assistant. You have access to a RAG system to search code, explain symbols, and index the codebase.\n\nAlways use the 'search_code' tool to find relevant code before answering questions about the codebase.\nIf the user asks to index a folder, use 'index_code'."
+        }
+      },
+      "id": "ai-agent",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.6,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "id": "openai-model",
+      "name": "OpenAI Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [
+        220,
+        220
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "OPENAI_API_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/query",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "={{ $fromAI(\"query\") }}"
+            },
+            {
+              "name": "k",
+              "value": "5"
+            }
+          ]
+        },
+        "toolDescription": "Search the codebase for code snippets relevant to the query.",
+        "toolName": "search_code"
+      },
+      "id": "tool-search",
+      "name": "Search Code",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1,
+      "position": [
+        500,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/index",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "path",
+              "value": "={{ $fromAI(\"path\") }}"
+            },
+            {
+              "name": "force",
+              "value": false
+            }
+          ]
+        },
+        "toolDescription": "Index the codebase at a specific path. Use this when the user asks to index or update the code.",
+        "toolName": "index_code"
+      },
+      "id": "tool-index",
+      "name": "Index Code",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1,
+      "position": [
+        660,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/mcp",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "method",
+              "value": "rag.explain"
+            },
+            {
+              "name": "params",
+              "value": "={{ { \"symbol\": $fromAI(\"symbol\") } }}"
+            },
+            {
+              "name": "id",
+              "value": 1
+            }
+          ]
+        },
+        "toolDescription": "Get an explanation for a specific code symbol or concept.",
+        "toolName": "explain_symbol"
+      },
+      "id": "tool-explain",
+      "name": "Explain Symbol",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1,
+      "position": [
+        820,
+        -100
+      ]
+    }
+  ],
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Code": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Index Code": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explain Symbol": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
