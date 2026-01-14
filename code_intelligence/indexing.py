@@ -250,31 +250,64 @@ class FileIndexer:
                 "function_definition", "class_definition", "method_definition", # Python, JS
                 "function_declaration", "method_declaration", # Java, C++
                 "func_literal", # Go
+                "arrow_function", # JS/TS
+                "lexical_declaration", "variable_declaration", # JS/TS constants
+                "interface_declaration", "type_alias_declaration", # TS
+                "jsx_element", "jsx_self_closing_element" # React
             }
 
             def traverse(node):
                 if node.type in relevant_types:
-                    name = self._get_node_name(node, content) or "anon"
-                    # Capture signature (first line)
-                    sig_line = content.splitlines()[node.start_point[0]]
+                    # Filter small variable declarations (likely not components)
+                    if node.type in ("lexical_declaration", "variable_declaration"):
+                        # Only index if it seems like a component or major constant (e.g. exported, or large body)
+                        # For now, we rely on _get_node_name logic.
+                        # Also check if it contains an arrow function to avoid double indexing if we index arrow_function too?
+                        # Actually, better to index the variable declaration if it creates a named component.
+                        pass
 
-                    code_node = self._create_node(
-                        full_path,
-                        content,
-                        node.start_point[0],
-                        node.end_point[0],
-                        node.type,
-                        name
-                    )
-                    nodes.append(code_node)
+                    name = self._get_node_name(node, content)
 
-                    symbols.append({
-                        "name": name,
-                        "kind": node.type,
-                        "start_line": node.start_point[0],
-                        "end_line": node.end_point[0],
-                        "signature": sig_line.strip()
-                    })
+                    # If it's an arrow function, it might be anonymous unless we look at parent
+                    if node.type == "arrow_function" and not name:
+                         # Try to get name from parent variable_declarator
+                         parent = node.parent
+                         if parent and parent.type == "variable_declarator":
+                             name = self._get_node_name(parent, content)
+
+                    if name and name != "anon":
+                        # Capture signature (first line)
+                        sig_line = content.splitlines()[node.start_point[0]]
+
+                        # Extra properties for JSX
+                        extra_props = {}
+                        if node.type in ("jsx_element", "jsx_self_closing_element"):
+                            extra_props = self._extract_jsx_props(node, content)
+
+                        # Deduplicate if we already indexed this range (e.g. var decl vs arrow func)
+                        # Use start line as proxy
+
+                        code_node = self._create_node(
+                            full_path,
+                            content,
+                            node.start_point[0],
+                            node.end_point[0],
+                            node.type,
+                            name,
+                            extra_props=extra_props
+                        )
+
+                        # Prevent duplicates (e.g. variable declaration and arrow function often share the same range/lines)
+                        if not any(n.id == code_node.id for n in nodes):
+                            nodes.append(code_node)
+
+                        symbols.append({
+                            "name": name,
+                            "kind": node.type,
+                            "start_line": node.start_point[0],
+                            "end_line": node.end_point[0],
+                            "signature": sig_line.strip()
+                        })
 
                 for child in node.children:
                     traverse(child)
@@ -288,19 +321,81 @@ class FileIndexer:
             return nodes, symbols
 
     def _get_node_name(self, node, content) -> Optional[str]:
+        # Specific handling for variable declarators (const x = ...)
+        if node.type == "variable_declarator":
+            for child in node.children:
+                if child.type == "identifier":
+                    return self._get_text(child, content)
+
+        # Specific handling for lexical declaration (const x = ...) - usually has a variable_declarator child
+        if node.type in ("lexical_declaration", "variable_declaration"):
+             for child in node.children:
+                 if child.type == "variable_declarator":
+                     return self._get_node_name(child, content)
+
+        # Class/Function declarations
         for child in node.children:
-            if child.type in ("identifier", "name"):
-                if hasattr(child, "text") and child.text:
-                    return child.text.decode("utf-8", errors="replace")
-                return bytes(content, "utf-8")[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+            if child.type in ("identifier", "name", "type_identifier", "property_identifier"):
+                 return self._get_text(child, content)
+
+            # JSX Component Name
+            if child.type == "jsx_opening_element":
+                 for subchild in child.children:
+                     if subchild.type in ("identifier", "jsx_identifier", "member_expression"):
+                         return self._get_text(subchild, content)
+
         return None
 
-    def _create_node(self, filepath: str, full_content: str, start_line: int, end_line: int, type: str, name: str) -> CodeNode:
+    def _get_text(self, node, content) -> str:
+        if hasattr(node, "text") and node.text:
+            return node.text.decode("utf-8", errors="replace")
+        return bytes(content, "utf-8")[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+    def _extract_jsx_props(self, node, content) -> Dict[str, Any]:
+        props = {}
+        # Find opening element
+        opening = None
+        for child in node.children:
+            if child.type in ("jsx_opening_element", "jsx_self_closing_element"): # self closing is the node itself? No, node is parent usually, but if type is self_closing it works
+                opening = child
+                break
+
+        # If the node itself is self-closing
+        if node.type == "jsx_self_closing_element":
+            opening = node
+
+        if not opening:
+            return props
+
+        for child in opening.children:
+            if child.type == "jsx_attribute":
+                # name = value
+                prop_name = None
+                prop_value = None
+                for sub in child.children:
+                    if sub.type == "property_identifier":
+                        prop_name = self._get_text(sub, content)
+                    elif sub.type == "string":
+                        prop_value = self._get_text(sub, content).strip('"\'')
+                    elif sub.type == "jsx_expression":
+                        # Just capture that it's an expression
+                        prop_value = "{...}"
+
+                if prop_name:
+                    props[prop_name] = prop_value
+
+        return props
+
+    def _create_node(self, filepath: str, full_content: str, start_line: int, end_line: int, type: str, name: str, extra_props: Dict = None) -> CodeNode:
         lines = full_content.splitlines()
         start_line = max(0, start_line)
         end_line = min(len(lines), end_line)
         chunk_content = "\n".join(lines[start_line : end_line + 1])
         node_id = f"{filepath}:{start_line}-{end_line}"
+
+        props = {"language": os.path.splitext(filepath)[1]}
+        if extra_props:
+            props.update(extra_props)
 
         return CodeNode(
             id=node_id,
@@ -310,7 +405,7 @@ class FileIndexer:
             start_line=start_line,
             end_line=end_line,
             content=chunk_content,
-            properties={"language": os.path.splitext(filepath)[1]}
+            properties=props
         )
 
     def _load_gitignore(self, root: str):
@@ -338,7 +433,7 @@ class FileIndexer:
 
         # pathspec 1.x logic
         # For gitignore behavior, we should use 'gitignore' style
-        spec = PathSpec.from_lines('gitwildmatch', patterns)
+        spec = PathSpec.from_lines('gitignore', patterns)
 
         def is_ignored(path: str) -> bool:
             # Pathspec expects path relative to root

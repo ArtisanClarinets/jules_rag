@@ -11,6 +11,8 @@ from code_intelligence.db import Database
 from code_intelligence.indexing import FileIndexer
 from code_intelligence.retrieval import RetrievalEngine
 from code_intelligence.answer import AnswerEngine
+from code_intelligence.classifier import QueryClassifier
+from code_intelligence.workflow import WorkflowEngine
 from code_intelligence.config import settings
 
 from pythonjsonlogger import jsonlogger
@@ -28,15 +30,19 @@ db: Optional[Database] = None
 indexer: Optional[FileIndexer] = None
 retriever: Optional[RetrievalEngine] = None
 answer_engine: Optional[AnswerEngine] = None
+classifier: Optional[QueryClassifier] = None
+workflow_engine: Optional[WorkflowEngine] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, indexer, retriever, answer_engine
+    global db, indexer, retriever, answer_engine, classifier, workflow_engine
     logger.info("Initializing Backend...")
     db = Database(settings.db_path)
     indexer = FileIndexer(db)
     retriever = RetrievalEngine(db)
     answer_engine = AnswerEngine()
+    classifier = QueryClassifier()
+    workflow_engine = WorkflowEngine(retriever)
     yield
     logger.info("Shutting down...")
 
@@ -119,15 +125,36 @@ def run_indexing(path: str, force: bool):
 
 @app.post("/query", response_model=QueryResponse)
 async def query_codebase(req: QueryRequest):
-    if not retriever or not answer_engine:
+    if not retriever or not answer_engine or not classifier or not workflow_engine:
          raise HTTPException(status_code=503, detail="Not initialized")
 
     logger.info(f"Query: {req.query}")
 
-    # 1. Retrieve
+    # 1. Classify
+    try:
+        class_res = classifier.classify(req.query)
+        category = class_res.get("category", "CODE")
+        logger.info(f"Query classified as: {category} (Reason: {class_res.get('reasoning')})")
+    except Exception as e:
+        logger.error(f"Classification error: {e}")
+        category = "CODE"
+
+    # 2. Execute Workflow if applicable
+    if category in ["PLAN", "DOCS"]:
+        try:
+            result = workflow_engine.run(category, req.query)
+            if result:
+                return QueryResponse(
+                    answer=result["answer"],
+                    citations=result.get("citations", [])
+                )
+        except Exception as e:
+            logger.error(f"Workflow failed: {e}, falling back to standard search.")
+
+    # 3. Standard Retrieval & Answer (CODE/GENERAL or Fallback)
     results = retriever.retrieve(req.query, k=req.k)
 
-    # 2. Answer
+    # 4. Answer
     output = answer_engine.answer(req.query, results)
 
     return QueryResponse(

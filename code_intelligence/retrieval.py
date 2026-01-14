@@ -155,14 +155,9 @@ class RetrievalEngine:
 
     def _rerank(self, query: str, candidates: List[SearchResult]) -> List[SearchResult]:
         """
-        Rerank using LLM or heuristic.
-        LLM reranking is expensive but accurate.
-        We can do a cheap 'keyword density' rerank or similar here as baseline.
-        Or use a cross-encoder if we had torch installed.
+        Rerank using heuristic + LLM.
         """
-        # For now, return as is or slight adjustment
-        # Maybe boost exact matches of query words in code content
-
+        # 1. Heuristic Rerank (fast)
         query_terms = set(query.lower().split())
 
         for cand in candidates:
@@ -176,4 +171,63 @@ class RetrievalEngine:
                 cand.score *= 1.5
 
         candidates.sort(key=lambda x: x.score, reverse=True)
-        return candidates
+
+        # 2. LLM Rerank (slower, high quality)
+        # Take top 10 candidates and ask LLM to pick the best ones
+        top_candidates = candidates[:10]
+        if not top_candidates:
+            return candidates
+
+        try:
+            reranked = self._llm_rerank(query, top_candidates)
+            return reranked + candidates[10:]
+        except Exception as e:
+            logger.warning(f"LLM Rerank failed: {e}")
+            return candidates
+
+    def _llm_rerank(self, query: str, candidates: List[SearchResult]) -> List[SearchResult]:
+        # Prepare context
+        items = []
+        for i, c in enumerate(candidates):
+            # Truncate content for prompt size efficiency
+            content_preview = c.node.content[:300].replace("\n", " ")
+            items.append(f"[{i}] {c.node.filepath}: {content_preview}")
+
+        prompt_items = "\n".join(items)
+
+        system_prompt = (
+            "You are a code retrieval expert. Rank the following code snippets based on their relevance to the user query.\n"
+            "Return a JSON object with a list 'indices' containing the indices of the snippets in order of relevance (most relevant first).\n"
+            "Example: {\"indices\": [2, 0, 1]}"
+        )
+
+        prompt = f"Query: {query}\n\nSnippets:\n{prompt_items}\n\nRank them."
+
+        # Low temperature for deterministic ranking
+        response = self.llm.generate_response(prompt, system_prompt=system_prompt, json_mode=True, temperature=0.0)
+
+        try:
+            data = json.loads(response)
+            indices = data.get("indices", [])
+        except json.JSONDecodeError:
+            return candidates
+
+        ranked_results = []
+        seen_indices = set()
+
+        for idx in indices:
+            if isinstance(idx, int) and 0 <= idx < len(candidates):
+                c = candidates[idx]
+                # Boost score to reflect LLM preference
+                # Ensure they stay at top
+                c.score = 50.0 - (len(ranked_results) * 1.0)
+                c.reason = "llm-rerank"
+                ranked_results.append(c)
+                seen_indices.add(idx)
+
+        # Add remaining that weren't ranked
+        for i, c in enumerate(candidates):
+            if i not in seen_indices:
+                ranked_results.append(c)
+
+        return ranked_results
