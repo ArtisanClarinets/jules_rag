@@ -13,9 +13,7 @@ export function activate(context: vscode.ExtensionContext) {
         
         try {
             // stream.progress('Thinking...');
-            // VS Code API change: stream.progress might not be available or used differently.
-            // Using placeholder text for now.
-            stream.markdown("Thinking...\n\n");
+            // In newer API, we assume stream handles markdown updates.
 
             const response = await fetch(`${getServerUrl()}/query`, {
                 method: 'POST',
@@ -31,31 +29,42 @@ export function activate(context: vscode.ExtensionContext) {
 
             const data: any = await response.json();
             
-            // Clear "Thinking..." if we could, but streaming appends.
-
             stream.markdown(data.answer);
 
             if (data.citations && data.citations.length > 0) {
-                stream.markdown('\n\n**Sources:**\n');
+                stream.markdown('\n\n---\n**Sources:**\n');
                 for (const cit of data.citations) {
                     // Create a clickable link
-                    // VS Code assumes paths are relative or proper URIs.
-                    // We can try to use markdown link syntax with file://
-                    const uri = vscode.Uri.file(cit.filepath);
-                    // Add line number: #L10
-                    // Note: VS Code sometimes struggles with local file links in markdown if not trusted.
-                    // We'll format it as `File (lines)` text for now, or Command link.
+                    // Construct URI relative to workspace if possible, or absolute.
+                    // Assuming cit.filepath is relative to root as per indexing logic (rel_path)
+                    // We need to resolve it to absolute path for VS Code to open it reliably if it's not just a name.
+                    // But backend sends what it has.
 
-                    stream.markdown(`- [${cit.filepath}:${cit.start_line}-${cit.end_line}](command:vscode.open?${encodeURIComponent(JSON.stringify(uri))})\n`);
+                    // Note: command:vscode.open expects a URI.
+                    // We try to find the file in workspace to get a proper URI.
 
-                    // A better way is referencing the file directly if the chat API supports it
-                    // For now, simple text:
-                    // stream.markdown(`- \`${cit.filepath}\` lines ${cit.start_line}-${cit.end_line}\n`);
+                    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+                    let uri: vscode.Uri;
+
+                    if (workspaceFolder) {
+                         uri = vscode.Uri.joinPath(workspaceFolder.uri, cit.filepath);
+                    } else {
+                         uri = vscode.Uri.file(cit.filepath);
+                    }
+
+                    // Range for selection
+                    const selection = new vscode.Range(cit.start_line, 0, cit.end_line, 0);
+                    // We can't easily pass selection in vscode.open arguments via markdown link command URI without encoding it complexly.
+                    // Standard vscode.open takes a URI.
+                    // A trick is to use `vscode.open` with fragment, but line numbers in fragments aren't standard in VS Code URIs unless handled.
+                    // Better: define a custom command in package.json/extension.ts that opens a file at a range, but let's stick to simple open for now.
+
+                    stream.markdown(`- [${cit.filepath} (Lines ${cit.start_line}-${cit.end_line})](command:vscode.open?${encodeURIComponent(JSON.stringify(uri))})\n`);
                 }
             }
             
         } catch (error) {
-            stream.markdown(`\n\nError communicating with backend: ${error}`);
+            stream.markdown(`\n\n**Error communicating with backend:**\n${error}\n\nPlease ensure the Code Intelligence server is running.`);
         }
         
         return { metadata: { command: '' } };

@@ -70,7 +70,12 @@ class TestIndexing(unittest.TestCase):
 
         stats = self.indexer.index_workspace(self.test_dir)
         # Should exclude node_modules.
-        self.assertEqual(stats["indexed"], 0)
+        # But .gitignore itself is indexed.
+        self.assertEqual(stats["indexed"], 1)
+
+        # Verify ignore.js is NOT indexed
+        nodes = self.db.get_nodes_by_filepath(os.path.join(self.test_dir, "node_modules", "ignore.js"))
+        self.assertEqual(len(nodes), 0)
 
 if __name__ == "__main__":
     unittest.main()
