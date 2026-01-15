@@ -29,7 +29,7 @@
     "chatParticipants": [
       {
         "id": "code-council",
-        "name": "Code Council",
+        "name": "code-council",
         "fullName": "Advanced Code Intelligence Council",
         "description": "AI council with deep codebase understanding"
       }
