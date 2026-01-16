@@ -13,3 +13,5 @@ python-dotenv
 tenacity
 jinja2
 python-json-logger
+pyyaml
+pytest

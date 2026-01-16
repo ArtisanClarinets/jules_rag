@@ -1,15 +1,16 @@
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass
 import json
 import time
+import os
 
 import numpy as np
-from rank_bm25 import BM25Okapi
 
 from .db import Database, CodeNode
-from .provider import EmbeddingsInterface, LLMInterface
+from .providers import EmbeddingsInterface, LLMInterface
 from .config import settings
+from .ann_index import ANNIndex
 
 logger = logging.getLogger(__name__)
 
@@ -30,71 +31,112 @@ class RetrievalEngine:
         self._embeddings_cache_ids: List[str] = []
         self._cache_timestamp: float = 0
 
+        # ANN Index
+        self.ann_index = ANNIndex(os.path.join(os.path.dirname(settings.db_path), "vectors.bin"))
+
     def retrieve(self, query: str, k: int = 10) -> List[SearchResult]:
-        """
-        Execute hybrid retrieval pipeline:
-        1. Query Rewriting (optional but recommended)
-        2. Sparse Search (FTS/BM25)
-        3. Dense Search (Embeddings)
-        4. Fusion (RRF)
-        5. Reranking
-        """
+        k = k or settings.retrieval_k
 
-        # 1. Query Expansion (simplified for now)
-        # We could ask LLM to generate synonyms or sub-queries.
-        queries = [query]
-
+        # 1. Sparse Search (FTS)
         all_results: Dict[str, SearchResult] = {}
 
-        for q in queries:
-            # 2. Sparse Search (FTS)
-            sparse_nodes = self.db.search_nodes(q, limit=k*2)
+        try:
+            sparse_nodes = self.db.search_nodes(query, limit=k*2)
             for i, node in enumerate(sparse_nodes):
-                # Normalize rank to score
                 score = 1.0 / (i + 1)
-                if node.id not in all_results:
-                    all_results[node.id] = SearchResult(node, score, "sparse")
-                else:
-                    all_results[node.id].score += score
+                all_results[node.id] = SearchResult(node, score, "sparse")
+        except Exception as e:
+            logger.error(f"Sparse search error: {e}")
 
-            # 3. Dense Search (Vector)
-            if self.embeddings.client:
-                try:
-                    q_vec = self.embeddings.embed([q])[0]
-                    dense_hits = self._vector_search(q_vec, k=k*2)
-                    for i, (node, score) in enumerate(dense_hits):
-                        # Fusion: Add scores (RRF-style simple addition here, or max)
-                        # RRF is usually 1 / (k + rank), we can just sum normalized scores.
-                        if node.id not in all_results:
-                            all_results[node.id] = SearchResult(node, score, "dense")
-                        else:
-                            all_results[node.id].score += score
-                except Exception as e:
-                    logger.warning(f"Dense search failed: {e}")
+        # 2. Dense Search (ANN / Brute)
+        if self.embeddings.client:
+            try:
+                q_vec = self.embeddings.embed([query])[0]
+                dense_hits = self._dense_search(q_vec, k=k*2)
 
-        # 4. Convert to list and sort
+                for node, score in dense_hits:
+                    # Fusion (Simple CombSUM)
+                    if node.id in all_results:
+                        all_results[node.id].score += score
+                        all_results[node.id].reason = "hybrid"
+                    else:
+                        all_results[node.id] = SearchResult(node, score, "dense")
+            except Exception as e:
+                logger.warning(f"Dense search failed: {e}")
+
         candidates = list(all_results.values())
         candidates.sort(key=lambda x: x.score, reverse=True)
-        candidates = candidates[:50] # Take top 50 for reranking
+        candidates = candidates[:50]
 
-        # 5. Rerank
-        reranked = self._rerank(query, candidates)
+        # 3. Graph Expansion
+        expanded = self._expand_graph(candidates, limit=5)
+        existing_ids = {c.node.id for c in candidates}
+        for ex in expanded:
+            if ex.node.id not in existing_ids:
+                candidates.append(ex)
 
-        return reranked[:k]
+        candidates.sort(key=lambda x: x.score, reverse=True)
+
+        # 4. Rerank (LLM)
+        reranked = self._rerank(query, candidates[:20])
+
+        # 5. MMR Selection
+        final_results = self._mmr(self.embeddings.embed([query])[0] if self.embeddings.client else None, reranked, k)
+
+        return final_results
+
+    def _dense_search(self, vector: List[float], k: int) -> List[Tuple[CodeNode, float]]:
+        vec_np = np.array(vector, dtype=np.float32)
+
+        if settings.retrieval_enable_ann and self.ann_index.available:
+            if not self.ann_index.index:
+                 if not self.ann_index.load():
+                     self._refresh_cache_if_needed()
+                     if self._embeddings_cache_matrix is not None:
+                         self.ann_index.build(self._embeddings_cache_matrix, self._embeddings_cache_ids)
+
+            if self.ann_index.index:
+                hits = self.ann_index.query(vec_np, k=k)
+                results = []
+                for nid, score in hits:
+                    node = self.db.get_node(nid)
+                    if node:
+                        results.append((node, score))
+                return results
+
+        return self._brute_force_search(vec_np, k)
+
+    def _brute_force_search(self, vector: np.ndarray, k: int) -> List[Tuple[CodeNode, float]]:
+        self._refresh_cache_if_needed()
+        if self._embeddings_cache_matrix is None:
+            return []
+
+        # Ensure vector is normalized (OpenAI usually is)
+        norm_v = np.linalg.norm(vector)
+        if norm_v > 0:
+            vector = vector / norm_v
+
+        scores = np.dot(self._embeddings_cache_matrix, vector)
+
+        top_k = min(k, len(scores))
+        if top_k == 0: return []
+
+        top_indices = np.argpartition(scores, -top_k)[-top_k:]
+        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+
+        results = []
+        for idx in top_indices:
+            nid = self._embeddings_cache_ids[idx]
+            node = self.db.get_node(nid)
+            if node:
+                results.append((node, float(scores[idx])))
+        return results
 
     def _refresh_cache_if_needed(self):
-        """Reload embeddings if cache is stale or empty."""
-        # Simple policy: refresh if empty or every 5 minutes.
-        # Ideally, we check DB last modified.
-        # For this exercise, we'll reload if empty.
-        # To support incremental updates, we'd need a more complex sync.
-
         if self._embeddings_cache_matrix is not None:
-             # Basic TTL check (e.g., 60s)
              if time.time() - self._cache_timestamp < 60:
                  return
 
-        logger.info("Refeshing embeddings cache...")
         conn = self.db._get_conn()
         cursor = conn.cursor()
         cursor.execute("SELECT node_id, vector FROM embeddings WHERE model = ?", (settings.embeddings_model,))
@@ -117,63 +159,107 @@ class RetrievalEngine:
         self._embeddings_cache_matrix = np.vstack(vecs)
         self._cache_timestamp = time.time()
 
-    def _vector_search(self, vector: List[float], k: int) -> List[Tuple[CodeNode, float]]:
-        """
-        Naive vector search using cached matrix.
-        """
-        self._refresh_cache_if_needed()
+    def _expand_graph(self, candidates: List[SearchResult], limit: int) -> List[SearchResult]:
+        expanded = []
+        seen = {c.node.id for c in candidates}
+        seeds = candidates[:3]
 
-        if self._embeddings_cache_matrix is None:
-            return []
+        conn = self.db._get_conn()
+        cursor = conn.cursor()
 
-        q_vec = np.array(vector, dtype=np.float32)
+        try:
+            for cand in seeds:
+                filename = os.path.basename(cand.node.filepath)
+                filename_no_ext = os.path.splitext(filename)[0]
 
-        # Cosine similarity
-        # A . B / (|A| * |B|)
+                # Check for files that import this one (naive LIKE check)
+                cursor.execute(
+                    "SELECT id FROM nodes WHERE import_deps LIKE ? LIMIT ?",
+                    (f"%{filename_no_ext}%", limit)
+                )
+                rows = cursor.fetchall()
+                for (nid,) in rows:
+                    if nid not in seen:
+                         node = self.db.get_node(nid)
+                         if node:
+                             expanded.append(SearchResult(node, cand.score * 0.5, "graph-neighbor"))
+                             seen.add(nid)
+        except Exception:
+            pass
+        finally:
+            conn.close()
 
-        # Norms
-        # Precompute matrix norms could be further optimization
-        norm_matrix = np.linalg.norm(self._embeddings_cache_matrix, axis=1)
-        norm_q = np.linalg.norm(q_vec)
+        return expanded
 
-        scores = np.dot(self._embeddings_cache_matrix, q_vec) / (norm_matrix * norm_q + 1e-9)
+    def _mmr(self, query_vec: Optional[np.ndarray], candidates: List[SearchResult], k: int) -> List[SearchResult]:
+        if query_vec is None or not candidates:
+            return candidates[:k]
 
-        # Top K
-        # If fewer items than K, take all
-        top_k = min(k, len(scores))
-        top_indices = np.argpartition(scores, -top_k)[-top_k:]
-        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+        lambda_param = settings.retrieval_mmr_lambda
+        selected = []
 
-        results = []
-        for idx in top_indices:
-            nid = self._embeddings_cache_ids[idx]
-            node = self.db.get_node(nid)
-            if node:
-                results.append((node, float(scores[idx])))
+        # Prepare vectors for candidates
+        cand_vecs = []
+        cand_map = {}
 
-        return results
+        if self._embeddings_cache_ids:
+             id_to_idx = {nid: i for i, nid in enumerate(self._embeddings_cache_ids)}
+             for c in candidates:
+                 if c.node.id in id_to_idx:
+                     cand_vecs.append(self._embeddings_cache_matrix[id_to_idx[c.node.id]])
+                     cand_map[len(cand_vecs)-1] = c
+
+        if not cand_vecs:
+            return candidates[:k]
+
+        cand_vecs = np.array(cand_vecs)
+
+        # Ensure normalization
+        norms = np.linalg.norm(cand_vecs, axis=1, keepdims=True)
+        cand_vecs = cand_vecs / (norms + 1e-9)
+
+        query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-9)
+
+        remaining_indices = list(range(len(cand_vecs)))
+
+        while len(selected) < k and remaining_indices:
+            best_score = -np.inf
+            best_idx = -1
+
+            for idx in remaining_indices:
+                sim_q = np.dot(cand_vecs[idx], query_vec)
+
+                if not selected:
+                    max_sim_s = 0
+                else:
+                    sims_s = [np.dot(cand_vecs[idx], cand_vecs[s_idx]) for s_idx in selected]
+                    max_sim_s = max(sims_s) if sims_s else 0
+
+                mmr_score = lambda_param * sim_q - (1 - lambda_param) * max_sim_s
+
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_idx = idx
+
+            if best_idx != -1:
+                selected.append(best_idx)
+                remaining_indices.remove(best_idx)
+
+        return [cand_map[i] for i in selected]
 
     def _rerank(self, query: str, candidates: List[SearchResult]) -> List[SearchResult]:
-        """
-        Rerank using heuristic + LLM.
-        """
-        # 1. Heuristic Rerank (fast)
+        # 1. Heuristic
         query_terms = set(query.lower().split())
-
         for cand in candidates:
-            # Boost score if name matches query terms
-            name_lower = cand.node.name.lower()
+            name_lower = cand.node.name.lower() if cand.node.name else ""
             if any(term in name_lower for term in query_terms):
                 cand.score *= 1.2
-
-            # Boost if content contains exact phrase
             if query in cand.node.content:
                 cand.score *= 1.5
 
         candidates.sort(key=lambda x: x.score, reverse=True)
 
-        # 2. LLM Rerank (slower, high quality)
-        # Take top 10 candidates and ask LLM to pick the best ones
+        # 2. LLM Rerank
         top_candidates = candidates[:10]
         if not top_candidates:
             return candidates
@@ -186,10 +272,8 @@ class RetrievalEngine:
             return candidates
 
     def _llm_rerank(self, query: str, candidates: List[SearchResult]) -> List[SearchResult]:
-        # Prepare context
         items = []
         for i, c in enumerate(candidates):
-            # Truncate content for prompt size efficiency
             content_preview = c.node.content[:300].replace("\n", " ")
             items.append(f"[{i}] {c.node.filepath}: {content_preview}")
 
@@ -197,13 +281,11 @@ class RetrievalEngine:
 
         system_prompt = (
             "You are a code retrieval expert. Rank the following code snippets based on their relevance to the user query.\n"
-            "Return a JSON object with a list 'indices' containing the indices of the snippets in order of relevance (most relevant first).\n"
+            "Return a JSON object with a list 'indices' containing the indices of the snippets in order of relevance.\n"
             "Example: {\"indices\": [2, 0, 1]}"
         )
-
         prompt = f"Query: {query}\n\nSnippets:\n{prompt_items}\n\nRank them."
 
-        # Low temperature for deterministic ranking
         response = self.llm.generate_response(prompt, system_prompt=system_prompt, json_mode=True, temperature=0.0)
 
         try:
@@ -218,14 +300,11 @@ class RetrievalEngine:
         for idx in indices:
             if isinstance(idx, int) and 0 <= idx < len(candidates):
                 c = candidates[idx]
-                # Boost score to reflect LLM preference
-                # Ensure they stay at top
                 c.score = 50.0 - (len(ranked_results) * 1.0)
                 c.reason = "llm-rerank"
                 ranked_results.append(c)
                 seen_indices.add(idx)
 
-        # Add remaining that weren't ranked
         for i, c in enumerate(candidates):
             if i not in seen_indices:
                 ranked_results.append(c)

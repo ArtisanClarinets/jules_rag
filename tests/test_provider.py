@@ -1,16 +1,18 @@
 import unittest
 from unittest.mock import MagicMock, patch
 from code_intelligence.config import Settings
-from code_intelligence.provider import LLMInterface
+from code_intelligence.providers.llm import LLMInterface
 from pydantic import SecretStr
 import os
 
 class TestConfig(unittest.TestCase):
     def test_default_config(self):
-        # We can't easily test default loading if it's already loaded,
-        # but we can test instantiation.
-        settings = Settings()
-        self.assertEqual(settings.llm_provider, "openai")
+        # Ensure env var is unset for this test
+        with patch.dict(os.environ):
+            if "LLM_PROVIDER" in os.environ:
+                del os.environ["LLM_PROVIDER"]
+            settings = Settings()
+            self.assertEqual(settings.llm_provider, "openai")
 
     def test_openrouter_config(self):
         with patch.dict(os.environ, {
@@ -25,8 +27,8 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(settings.llm_model, "anthropic/claude-3-opus")
 
 class TestProvider(unittest.TestCase):
-    @patch("code_intelligence.provider.OpenAI")
-    @patch("code_intelligence.provider.settings")
+    @patch("code_intelligence.providers.llm.OpenAI")
+    @patch("code_intelligence.providers.llm.settings")
     def test_llm_generation(self, mock_settings, mock_openai):
         # Mock settings
         mock_settings.get_llm_api_key.return_value = SecretStr("sk-test")
@@ -36,6 +38,7 @@ class TestProvider(unittest.TestCase):
         mock_settings.llm_temperature = 0.0
         mock_settings.llm_max_tokens = 100
         mock_settings.llm_prefer_json = True
+        mock_settings.rag_redact_secrets = False
 
         # Mock client
         mock_client = MagicMock()
@@ -51,8 +54,8 @@ class TestProvider(unittest.TestCase):
         response = llm.generate_response("hello", json_mode=True)
         self.assertEqual(response, '{"foo": "bar"}')
 
-    @patch("code_intelligence.provider.OpenAI")
-    @patch("code_intelligence.provider.settings")
+    @patch("code_intelligence.providers.llm.OpenAI")
+    @patch("code_intelligence.providers.llm.settings")
     def test_json_fallback(self, mock_settings, mock_openai):
         mock_settings.get_llm_api_key.return_value = SecretStr("sk-test")
         mock_settings.get_llm_base_url.return_value = "https://api.openai.com/v1"
@@ -61,6 +64,7 @@ class TestProvider(unittest.TestCase):
         mock_settings.llm_temperature = 0.0
         mock_settings.llm_max_tokens = 100
         mock_settings.llm_prefer_json = True
+        mock_settings.rag_redact_secrets = False
 
         mock_client = MagicMock()
         mock_openai.return_value = mock_client

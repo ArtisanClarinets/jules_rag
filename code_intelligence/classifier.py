@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Dict, Any
 
-from .provider import LLMInterface
+from .providers import LLMInterface
 
 logger = logging.getLogger(__name__)
 
