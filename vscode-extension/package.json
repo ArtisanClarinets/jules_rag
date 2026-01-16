@@ -1,5 +1,6 @@
 {
   "name": "advanced-code-intelligence",
+  "publisher": "code-council",
   "displayName": "Advanced Code Intelligence RAG",
   "version": "1.0.0",
   "description": "Self-optimizing, multi-layered RAG system for VS Code",
