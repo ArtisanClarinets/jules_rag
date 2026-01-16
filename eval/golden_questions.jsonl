@@ -1,0 +1,8 @@
+{"question": "Where is the /api/rag endpoint implemented?", "expected_path": "api/server.py"}
+{"question": "Which page renders Dashboard?", "expected_path": "app/dashboard/page.tsx"}
+{"question": "What middleware runs on every request?", "expected_path": "middleware.ts"}
+{"question": "Where is runtime set to edge?", "expected_path": "app/api/edge/route.ts"}
+{"question": "Which components are client components?", "expected_content": "use client"}
+{"question": "Where is the DB schema defined?", "expected_path": "code_intelligence/db.py"}
+{"question": "How is indexing implemented?", "expected_path": "code_intelligence/indexing.py"}
+{"question": "Where is the Next.js semantics logic?", "expected_path": "code_intelligence/next_semantics.py"}

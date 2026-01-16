@@ -1,9 +1,26 @@
 from __future__ import annotations
 
-from typing import Optional, Set
+import os
+import yaml
+from typing import Optional, Set, List, Dict, Any, Tuple
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict, PydanticBaseSettingsSource
 
+def yaml_config_settings_source() -> Dict[str, Any]:
+    """
+    A simple settings source that loads variables from a YAML file
+    at the project's root.
+    """
+    yaml_file = "rag_config.yaml"
+    if not os.path.exists(yaml_file):
+        return {}
+
+    try:
+        with open(yaml_file, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 class Settings(BaseSettings):
     # LLM Settings
@@ -30,24 +47,57 @@ class Settings(BaseSettings):
     embeddings_model: str = Field("openai/text-embedding-3-small", validation_alias="EMBEDDINGS_MODEL")
     embeddings_batch_size: int = Field(64, validation_alias="EMBEDDINGS_BATCH_SIZE")
 
-    # Privacy & Limits
+    # Retrieval Settings
+    retrieval_k: int = Field(10, validation_alias="RETRIEVAL_K")
+    retrieval_mmr_lambda: float = Field(0.5, validation_alias="RETRIEVAL_MMR_LAMBDA")
+    retrieval_max_chunks_per_file: int = Field(5, validation_alias="RETRIEVAL_MAX_CHUNKS_PER_FILE")
+    retrieval_enable_ann: bool = Field(True, validation_alias="RETRIEVAL_ENABLE_ANN")
+
+    # Indexing Settings
     rag_allow_globs: Set[str] = Field(default_factory=set, validation_alias="RAG_ALLOW_GLOBS")
     rag_deny_globs: Set[str] = Field(default_factory=set, validation_alias="RAG_DENY_GLOBS")
-    rag_max_file_mb: int = Field(2, validation_alias="RAG_MAX_FILE_MB")  # Default 2MB
+    rag_max_file_mb: int = Field(2, validation_alias="RAG_MAX_FILE_MB")
     rag_max_tokens_context: int = Field(8000, validation_alias="RAG_MAX_TOKENS_CONTEXT")
     rag_send_code_to_remote: bool = Field(False, validation_alias="RAG_SEND_CODE_TO_REMOTE")
+
+    # Next.js Specific Defaults
+    next_ignore_dirs: Set[str] = Field(
+        default_factory=lambda: {'.next', 'node_modules', 'dist', 'build', '.turbo', 'coverage'},
+        validation_alias="NEXT_IGNORE_DIRS"
+    )
 
     # Storage
     db_path: str = Field("codegraph.db", validation_alias="DB_PATH")
 
     # API Security
-    rag_api_token: Optional[SecretStr] = Field(None, validation_alias="RAG_API_TOKEN")
+    rag_api_token: Optional[SecretStr] = Field(None, validation_alias="RAG_API_TOKEN") # Legacy single token
+    rag_api_keys: List[SecretStr] = Field(default_factory=list, validation_alias="RAG_API_KEYS") # Comma separated
+    rag_allowed_roots: List[str] = Field(default_factory=list, validation_alias="RAG_ALLOWED_ROOTS")
+    rag_redact_secrets: bool = Field(True, validation_alias="RAG_REDACT_SECRETS")
+    rag_allow_external_llm: bool = Field(True, validation_alias="RAG_ALLOW_EXTERNAL_LLM")
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore"
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            yaml_config_settings_source,
+            file_secret_settings,
+        )
 
     def get_llm_api_key(self) -> SecretStr | None:
         if self.llm_provider == "openrouter":

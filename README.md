@@ -1,71 +1,68 @@
-# Advanced Code Intelligence RAG System (Prototype)
+# Advanced Code Intelligence RAG System (Next.js Edition)
 
 ## Overview
-This project serves as a foundational prototype for a multi-layered RAG architecture. It implements the core AST-aware indexing for Python and outlines the agentic architecture. 
+A production-grade RAG engine optimized for **Next.js App Router** repositories. It features symbol-centric indexing, hybrid retrieval (BM25 + ANN + Graph), and a secure streaming API.
 
-**Note**: This is a foundational implementation. It uses SQLite for persistence and supports **OpenAI or OpenRouter** for chat + embeddings.
-
-## Directory Structure
-- `code_intelligence/`: Core Python engine for indexing, retrieval, and validation.
-- `vscode-extension/`: VS Code extension integration.
-- `api/`: Backend API (Placeholder).
+## Features
+- **Next.js Awareness**: Understands App Router structure (`page`, `layout`, `route`), `use client/server` directives, and exports.
+- **Hybrid Retrieval**: FTS5 BM25 + Embeddings (HNSW/Brute) + Graph Expansion + MMR.
+- **Strict Citations**: Citations include file path, line ranges, and Next.js route metadata.
+- **Streaming**: NDJSON streaming endpoint for real-time answers.
+- **Security**: Secret masking, API key auth, rate limiting.
 
 ## Setup
 1. Install Python dependencies:
    ```bash
    pip install -r requirements.txt
+   # Optional: pip install hnswlib for faster ANN
    ```
 
-2. Run CLI:
+2. Configure `rag_config.yaml` (optional, or use env vars):
+   ```yaml
+   RETRIEVAL_K: 10
+   RAG_REDACT_SECRETS: true
+   LLM_PROVIDER: openai
+   ```
+
+3. Index a Repo:
    ```bash
-   # Index the codebase
-   python -m code_intelligence.cli index /path/to/codebase
-   
-   # Query via CLI
-   python -m code_intelligence.cli query "How does authentication work?"
+   python scripts/index_repo.py --root /path/to/nextjs-repo --mode incremental
    ```
 
-3. Run API Server (for VS Code Extension):
+4. Run Server:
    ```bash
    python api/server.py
    ```
 
-## LLM + Embeddings configuration (OpenAI or OpenRouter)
+## API Usage
 
-This repo supports OpenAI-compatible APIs via environment variables.
+### Streaming Query
+`POST /query_stream`
+Headers: `Authorization: Bearer <key>`
+Body: `{"query": "..."}`
 
-### OpenAI
-
-```bash
-export LLM_PROVIDER=openai
-export OPENAI_API_KEY=...
-export LLM_MODEL=gpt-4o-mini
-export EMBEDDINGS_MODEL=text-embedding-3-small
+Response (NDJSON):
+```json
+{"type": "retrieval_start", "query": "..."}
+{"type": "retrieval_result", "items": [{"path": "...", "route": "/dashboard", ...}]}
+{"type": "generation_chunk", "text": "..."}
+{"type": "done", "answer": "...", "citations": [...]}
 ```
 
-### OpenRouter
+## Next.js Integration
+See `examples/nextjs/app/api/rag/route.ts` for a Next.js Route Handler example that proxies requests to this engine.
 
+## Evaluation
+Run the evaluation harness:
 ```bash
-export LLM_PROVIDER=openrouter
-export OPENROUTER_API_KEY=...
-export LLM_MODEL=openai/gpt-4o-mini
-export EMBEDDINGS_MODEL=openai/text-embedding-3-small
-
-# Optional attribution headers (recommended by OpenRouter)
-export OPENROUTER_HTTP_REFERER=https://your.site
-export OPENROUTER_X_TITLE="My VS Code RAG"
+python scripts/run_eval.py
 ```
+This runs a set of golden questions (in `eval/golden_questions.jsonl`) and reports latency and recall metrics.
 
-## Architecture
-1. **Indexing Layer**: AST parser (Python) builds a `CodeGraph`.
-2. **Retrieval Layer**: Orchestrator with semantic and syntactic agents.
-3. **Validation Layer**: Council of Judges validates results.
-
-### Recent improvements
-- Hybrid retrieval: BM25 candidate generation + optional dense rerank (when embeddings are configured)
-- Stored embeddings in SQLite (reused across runs)
-- Stable hashing fallback (no Python hash randomization)
-- Optional `.gitignore`-aware indexing (via `pathspec`) and default ignores
-
-## Security Note
-API keys are read from environment variables. For VS Code usage, store keys in VS Code SecretStorage.
+## Configuration Options
+| Env Var | YAML Key | Default | Description |
+|---------|----------|---------|-------------|
+| `LLM_PROVIDER` | `llm_provider` | `openai` | `openai`, `openrouter`, or `local` |
+| `RAG_API_KEYS` | `rag_api_keys` | `[]` | List of allowed API keys |
+| `RAG_REDACT_SECRETS` | `rag_redact_secrets` | `true` | Mask secrets in prompts |
+| `RETRIEVAL_ENABLE_ANN` | `retrieval_enable_ann` | `true` | Use HNSW if available |

@@ -4,7 +4,7 @@ import json
 import logging
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 import numpy as np
@@ -22,6 +22,17 @@ class CodeNode:
     end_line: int
     content: str
     properties: Dict[str, Any]
+    # New fields for Next.js and Metadata
+    next_route_path: Optional[str] = None
+    next_segment_type: Optional[str] = None
+    next_use_client: bool = False
+    next_use_server: bool = False
+    next_is_route_handler: bool = False
+    next_runtime: Optional[str] = None
+    import_deps: Optional[List[str]] = None
+    file_hash: Optional[str] = None
+    git_sha: Optional[str] = None
+    repo_id: str = "default"
 
 class Database:
     def __init__(self, db_path: Optional[str] = None):
@@ -30,7 +41,6 @@ class Database:
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
-        # Enable WAL mode for better concurrency
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
@@ -40,7 +50,6 @@ class Database:
         conn = self._get_conn()
         cursor = conn.cursor()
         
-        # Version table
         cursor.execute('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER)')
         cursor.execute('SELECT version FROM schema_version')
         row = cursor.fetchone()
@@ -62,7 +71,6 @@ class Database:
                 last_modified REAL
             )
             ''')
-
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS edges (
                 source_id TEXT,
@@ -74,13 +82,11 @@ class Database:
                 FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE
             )
             ''')
-
             cursor.execute('''
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
                 id, name, content, filepath
             )
             ''')
-
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS embeddings (
                 node_id TEXT,
@@ -91,8 +97,6 @@ class Database:
                 FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
             )
             ''')
-
-            # Repo map / file hash tracking for incremental indexing
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS file_hashes (
                 filepath TEXT PRIMARY KEY,
@@ -100,7 +104,6 @@ class Database:
                 last_indexed REAL
             )
             ''')
-
             cursor.execute('DELETE FROM schema_version')
             cursor.execute('INSERT INTO schema_version VALUES (1)')
             current_version = 1
@@ -120,7 +123,6 @@ class Database:
             )
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_index_runs_root_time ON index_runs(repo_root, created_at)')
-
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS repo_maps (
                 index_run_id    INTEGER PRIMARY KEY,
@@ -132,7 +134,6 @@ class Database:
                 FOREIGN KEY(index_run_id) REFERENCES index_runs(id) ON DELETE CASCADE
             )
             ''')
-
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS repo_map_entries (
                 id              INTEGER PRIMARY KEY,
@@ -152,15 +153,51 @@ class Database:
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_repo_map_entries_run_kind ON repo_map_entries(index_run_id, kind)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_repo_map_entries_run_path ON repo_map_entries(index_run_id, path)')
-
             cursor.execute('''
             CREATE VIRTUAL TABLE IF NOT EXISTS repo_map_entries_fts
             USING fts5(path, symbol_name, signature, summary, excerpt,
                     content='repo_map_entries', content_rowid='id')
             ''')
-
             cursor.execute('DELETE FROM schema_version')
             cursor.execute('INSERT INTO schema_version VALUES (2)')
+            conn.commit()
+
+        # Migration 3: Next.js Metadata & FTS Upgrade
+        if current_version < 3:
+            logger.info("Applying migration 3")
+            try:
+                cursor.execute('ALTER TABLE nodes ADD COLUMN next_route_path TEXT')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN next_segment_type TEXT')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN next_use_client INTEGER DEFAULT 0')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN next_use_server INTEGER DEFAULT 0')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN next_is_route_handler INTEGER DEFAULT 0')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN next_runtime TEXT')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN import_deps TEXT')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN file_hash TEXT')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN git_sha TEXT')
+                cursor.execute('ALTER TABLE nodes ADD COLUMN repo_id TEXT DEFAULT "default"')
+            except sqlite3.OperationalError:
+                # Columns might already exist if re-running partial migration
+                pass
+
+            # Recreate FTS table to include new fields
+            cursor.execute('DROP TABLE IF EXISTS nodes_fts')
+            # Note: We are not using content='nodes' because we want flexibility and direct control over FTS content
+            cursor.execute('''
+            CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                id, name, content, filepath, next_route_path, next_segment_type, symbol_kind
+            )
+            ''')
+
+            # Re-populate FTS from existing nodes
+            # Note: we need to cast type to symbol_kind
+            cursor.execute('''
+            INSERT INTO nodes_fts (id, name, content, filepath, next_route_path, next_segment_type, symbol_kind)
+            SELECT id, name, content, filepath, next_route_path, next_segment_type, type FROM nodes
+            ''')
+
+            cursor.execute('DELETE FROM schema_version')
+            cursor.execute('INSERT INTO schema_version VALUES (3)')
             conn.commit()
 
         conn.close()
@@ -170,17 +207,29 @@ class Database:
         cursor = conn.cursor()
         
         props_json = json.dumps(node.properties)
+        import_deps_json = json.dumps(node.import_deps) if node.import_deps else None
         
-        cursor.execute('''
-        INSERT OR REPLACE INTO nodes (id, type, name, filepath, start_line, end_line, content, properties, last_modified)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (node.id, node.type, node.name, node.filepath, node.start_line, node.end_line, node.content, props_json, time.time()))
+        sql = '''
+        INSERT OR REPLACE INTO nodes (
+            id, type, name, filepath, start_line, end_line, content, properties, last_modified,
+            next_route_path, next_segment_type, next_use_client, next_use_server, next_is_route_handler,
+            next_runtime, import_deps, file_hash, git_sha, repo_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        '''
+        params = (
+            node.id, node.type, node.name, node.filepath, node.start_line, node.end_line, node.content, props_json, time.time(),
+            node.next_route_path, node.next_segment_type,
+            1 if node.next_use_client else 0, 1 if node.next_use_server else 0, 1 if node.next_is_route_handler else 0,
+            node.next_runtime, import_deps_json, node.file_hash, node.git_sha, node.repo_id
+        )
+        cursor.execute(sql, params)
         
         # Update FTS
         cursor.execute('''
-        INSERT OR REPLACE INTO nodes_fts (id, name, content, filepath)
-        VALUES (?, ?, ?, ?)
-        ''', (node.id, node.name, node.content, node.filepath))
+        INSERT OR REPLACE INTO nodes_fts (id, name, content, filepath, next_route_path, next_segment_type, symbol_kind)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (node.id, node.name, node.content, node.filepath, node.next_route_path, node.next_segment_type, node.type))
 
         conn.commit()
         conn.close()
@@ -194,17 +243,32 @@ class Database:
 
         for node in nodes:
             props_json = json.dumps(node.properties)
-            node_data.append((node.id, node.type, node.name, node.filepath, node.start_line, node.end_line, node.content, props_json, time.time()))
-            fts_data.append((node.id, node.name, node.content, node.filepath))
+            import_deps_json = json.dumps(node.import_deps) if node.import_deps else None
+
+            node_data.append((
+                node.id, node.type, node.name, node.filepath, node.start_line, node.end_line, node.content, props_json, time.time(),
+                node.next_route_path, node.next_segment_type,
+                1 if node.next_use_client else 0, 1 if node.next_use_server else 0, 1 if node.next_is_route_handler else 0,
+                node.next_runtime, import_deps_json, node.file_hash, node.git_sha, node.repo_id
+            ))
+
+            fts_data.append((
+                node.id, node.name, node.content, node.filepath, node.next_route_path, node.next_segment_type, node.type
+            ))
+
+        sql = '''
+        INSERT OR REPLACE INTO nodes (
+            id, type, name, filepath, start_line, end_line, content, properties, last_modified,
+            next_route_path, next_segment_type, next_use_client, next_use_server, next_is_route_handler,
+            next_runtime, import_deps, file_hash, git_sha, repo_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        '''
+        cursor.executemany(sql, node_data)
 
         cursor.executemany('''
-        INSERT OR REPLACE INTO nodes (id, type, name, filepath, start_line, end_line, content, properties, last_modified)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', node_data)
-
-        cursor.executemany('''
-        INSERT OR REPLACE INTO nodes_fts (id, name, content, filepath)
-        VALUES (?, ?, ?, ?)
+        INSERT OR REPLACE INTO nodes_fts (id, name, content, filepath, next_route_path, next_segment_type, symbol_kind)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', fts_data)
         
         conn.commit()
@@ -224,15 +288,41 @@ class Database:
         conn.commit()
         conn.close()
 
+    def get_edges(self, node_id: str, direction: str = "out") -> List[Tuple[str, str]]:
+        """
+        Get edges connected to a node.
+        direction: 'out' (sources=node_id) or 'in' (targets=node_id)
+        Returns list of (neighbor_id, relationship)
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        if direction == "out":
+            cursor.execute('SELECT target_id, relationship FROM edges WHERE source_id = ?', (node_id,))
+        else:
+            cursor.execute('SELECT source_id, relationship FROM edges WHERE target_id = ?', (node_id,))
+
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
     def get_node(self, node_id: str) -> Optional[CodeNode]:
         conn = self._get_conn()
         cursor = conn.cursor()
         
-        cursor.execute('SELECT id, type, name, filepath, start_line, end_line, content, properties FROM nodes WHERE id = ?', (node_id,))
+        # Select all columns
+        cursor.execute('''
+            SELECT
+                id, type, name, filepath, start_line, end_line, content, properties,
+                next_route_path, next_segment_type, next_use_client, next_use_server, next_is_route_handler,
+                next_runtime, import_deps, file_hash, git_sha, repo_id
+            FROM nodes WHERE id = ?
+        ''', (node_id,))
         row = cursor.fetchone()
         conn.close()
         
         if row:
+            import_deps = json.loads(row[14]) if row[14] else None
             return CodeNode(
                 id=row[0],
                 type=row[1],
@@ -241,19 +331,37 @@ class Database:
                 start_line=row[4],
                 end_line=row[5],
                 content=row[6],
-                properties=json.loads(row[7])
+                properties=json.loads(row[7]),
+                next_route_path=row[8],
+                next_segment_type=row[9],
+                next_use_client=bool(row[10]),
+                next_use_server=bool(row[11]),
+                next_is_route_handler=bool(row[12]),
+                next_runtime=row[13],
+                import_deps=import_deps,
+                file_hash=row[15],
+                git_sha=row[16],
+                repo_id=row[17]
             )
         return None
 
     def get_nodes_by_filepath(self, filepath: str) -> List[CodeNode]:
         conn = self._get_conn()
         cursor = conn.cursor()
-        cursor.execute('SELECT id, type, name, filepath, start_line, end_line, content, properties FROM nodes WHERE filepath = ?', (filepath,))
+        cursor.execute('''
+            SELECT
+                id, type, name, filepath, start_line, end_line, content, properties,
+                next_route_path, next_segment_type, next_use_client, next_use_server, next_is_route_handler,
+                next_runtime, import_deps, file_hash, git_sha, repo_id
+            FROM nodes WHERE filepath = ?
+        ''', (filepath,))
         rows = cursor.fetchall()
         conn.close()
 
-        return [
-            CodeNode(
+        nodes = []
+        for row in rows:
+            import_deps = json.loads(row[14]) if row[14] else None
+            nodes.append(CodeNode(
                 id=row[0],
                 type=row[1],
                 name=row[2],
@@ -261,15 +369,23 @@ class Database:
                 start_line=row[4],
                 end_line=row[5],
                 content=row[6],
-                properties=json.loads(row[7])
-            ) for row in rows
-        ]
+                properties=json.loads(row[7]),
+                next_route_path=row[8],
+                next_segment_type=row[9],
+                next_use_client=bool(row[10]),
+                next_use_server=bool(row[11]),
+                next_is_route_handler=bool(row[12]),
+                next_runtime=row[13],
+                import_deps=import_deps,
+                file_hash=row[15],
+                git_sha=row[16],
+                repo_id=row[17]
+            ))
+        return nodes
 
     def delete_nodes_by_filepath(self, filepath: str):
         conn = self._get_conn()
         cursor = conn.cursor()
-
-        # Get IDs to delete from FTS and Embeddings
         cursor.execute('SELECT id FROM nodes WHERE filepath = ?', (filepath,))
         ids = [row[0] for row in cursor.fetchall()]
 
@@ -278,26 +394,24 @@ class Database:
             return
 
         cursor.execute('DELETE FROM nodes WHERE filepath = ?', (filepath,))
-
         placeholders = ",".join(["?"] * len(ids))
         cursor.execute(f'DELETE FROM nodes_fts WHERE id IN ({placeholders})', ids)
         cursor.execute(f'DELETE FROM embeddings WHERE node_id IN ({placeholders})', ids)
         cursor.execute(f'DELETE FROM edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})', ids + ids)
-
         conn.commit()
         conn.close()
 
     def search_nodes(self, query: str, limit: int = 10) -> List[CodeNode]:
-        """Full text search using FTS5 with robust query handling."""
+        """Full text search using FTS5."""
         conn = self._get_conn()
         cursor = conn.cursor()
         
-        # Escape double quotes to prevent syntax errors
         safe_query = query.replace('"', '""')
+        # We can eventually add field specific queries here if we want to boost columns
+        # e.g. "name:query^2 OR content:query"
+        # But for now basic MATCH is okay.
 
         try:
-            # We wrap in double quotes for phrase search, or standard match
-            # Using simple query for now
             cursor.execute(
                 '''
             SELECT id FROM nodes_fts WHERE nodes_fts MATCH ? ORDER BY bm25(nodes_fts) LIMIT ?
@@ -306,10 +420,7 @@ class Database:
             )
             ids = [row[0] for row in cursor.fetchall()]
         except sqlite3.OperationalError:
-             # Fallback for malformed queries: try basic token matching or just return empty
-             # Or try to clean the query further
-             logger.warning(f"FTS5 query failed: {safe_query}. Retrying with sanitized version.")
-             # Very basic sanitization: remove special chars
+             logger.warning(f"FTS5 query failed: {safe_query}. Retrying sanitized.")
              sanitized = "".join(c for c in safe_query if c.isalnum() or c.isspace())
              cursor.execute(
                 '''
@@ -329,7 +440,6 @@ class Database:
         return nodes
 
     def upsert_embedding(self, node_id: str, model: str, vector: np.ndarray):
-        """Persist an embedding vector for a node."""
         vec = np.asarray(vector, dtype=np.float32)
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -381,12 +491,21 @@ class Database:
     def get_all_nodes(self) -> List[CodeNode]:
         conn = self._get_conn()
         cursor = conn.cursor()
-        cursor.execute('SELECT id, type, name, filepath, start_line, end_line, content, properties FROM nodes')
+        # Fetch all cols
+        cursor.execute('''
+            SELECT
+                id, type, name, filepath, start_line, end_line, content, properties,
+                next_route_path, next_segment_type, next_use_client, next_use_server, next_is_route_handler,
+                next_runtime, import_deps, file_hash, git_sha, repo_id
+            FROM nodes
+        ''')
         rows = cursor.fetchall()
         conn.close()
         
-        return [
-            CodeNode(
+        nodes = []
+        for row in rows:
+            import_deps = json.loads(row[14]) if row[14] else None
+            nodes.append(CodeNode(
                 id=row[0],
                 type=row[1],
                 name=row[2],
@@ -394,12 +513,21 @@ class Database:
                 start_line=row[4],
                 end_line=row[5],
                 content=row[6],
-                properties=json.loads(row[7])
-            ) for row in rows
-        ]
+                properties=json.loads(row[7]),
+                next_route_path=row[8],
+                next_segment_type=row[9],
+                next_use_client=bool(row[10]),
+                next_use_server=bool(row[11]),
+                next_is_route_handler=bool(row[12]),
+                next_runtime=row[13],
+                import_deps=import_deps,
+                file_hash=row[15],
+                git_sha=row[16],
+                repo_id=row[17]
+            ))
+        return nodes
 
-    # --- Repo Map Methods ---
-
+    # --- Repo Map Methods (Unchanged mostly) ---
     def create_index_run(self, repo_root: str, config_hash: str) -> int:
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -420,24 +548,17 @@ class Database:
         conn.close()
 
     def store_repo_map(self, run_id: int, payload: Dict[str, Any], entries: List[Dict[str, Any]]):
-        """
-        Stores the full repo map and granular entries transactionally.
-        """
         conn = self._get_conn()
         cursor = conn.cursor()
         
-        # 1. Store Header
         payload_json = json.dumps(payload)
         cursor.execute('''
             INSERT INTO repo_maps (index_run_id, format_version, generated_at, payload_json)
             VALUES (?, ?, ?, ?)
         ''', (run_id, 1, time.time(), payload_json))
 
-        # 2. Store Entries
         entries_data = []
-        fts_data = []
         for e in entries:
-            # kind, path, symbol_name, signature, start, end, importance, summary, excerpt, meta
             meta_json = json.dumps(e.get("meta", {}))
             entries_data.append((
                 run_id,
@@ -453,28 +574,12 @@ class Database:
                 meta_json
             ))
 
-            # FTS data: path, symbol, signature, summary, excerpt
-            # FTS5 insert is tricky if we want to link rowid.
-            # We insert into main table first to get ROWID? No, we use bulk insert.
-            # SQLite `executemany` doesn't return last inserted IDs easily.
-            # For simplicity, we'll insert one by one or rely on matching order if using rowid.
-            # Or: Since we use `content='repo_map_entries'`, we must insert into the virtual table appropriately
-            # to trigger the index update if it was an external content table.
-            # But here `content='repo_map_entries'` means FTS *reads* from that table.
-            # With `content='table'`, we need to manually INSERT into the FTS table (id, col1, col2...)
-            # referencing the rowid of the main table as `rowid`.
-
-            # Actually, `content='table'` requires explicit triggers or manual inserts to keep in sync.
-            # Given we are doing a batch write once per run, manual sync is fine.
-
         cursor.executemany('''
             INSERT INTO repo_map_entries
             (index_run_id, kind, path, symbol_name, signature, start_line, end_line, importance, summary, excerpt, meta_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', entries_data)
 
-        # Now we need to populate FTS.
-        # Since we just inserted, we can select back or just insert into FTS using the main table data for this run.
         cursor.execute('''
             INSERT INTO repo_map_entries_fts (rowid, path, symbol_name, signature, summary, excerpt)
             SELECT id, path, symbol_name, signature, summary, excerpt FROM repo_map_entries WHERE index_run_id = ?

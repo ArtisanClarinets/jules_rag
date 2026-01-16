@@ -1,11 +1,14 @@
 import os
 import logging
+import json
+import time
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from code_intelligence.db import Database
 from code_intelligence.indexing import FileIndexer
@@ -32,6 +35,24 @@ retriever: Optional[RetrievalEngine] = None
 answer_engine: Optional[AnswerEngine] = None
 classifier: Optional[QueryClassifier] = None
 workflow_engine: Optional[WorkflowEngine] = None
+
+# Rate Limit State
+RATE_LIMIT_STORE = {}
+RATE_LIMIT_CAPACITY = 50.0
+RATE_LIMIT_RATE = 1.0
+
+def check_rate_limit(key: str) -> bool:
+    now = time.time()
+    tokens, last_update = RATE_LIMIT_STORE.get(key, (RATE_LIMIT_CAPACITY, now))
+    elapsed = now - last_update
+    tokens = min(RATE_LIMIT_CAPACITY, tokens + elapsed * RATE_LIMIT_RATE)
+
+    if tokens >= 1.0:
+        RATE_LIMIT_STORE[key] = (tokens - 1.0, now)
+        return True
+
+    RATE_LIMIT_STORE[key] = (tokens, now)
+    return False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -76,7 +97,6 @@ class SearchRequest(BaseModel):
     k: int = 10
 
 class MCPCallRequest(BaseModel):
-    # Simplified MCP JSON-RPC wrapper
     jsonrpc: str = "2.0"
     method: str
     params: Dict[str, Any] = {}
@@ -86,16 +106,37 @@ class MCPCallRequest(BaseModel):
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    # Local Token Auth
-    if settings.rag_api_token:
-        auth = request.headers.get("Authorization")
-        expected = f"Bearer {settings.rag_api_token.get_secret_value()}"
-        if auth != expected:
-             # Allow health check without auth? Usually yes.
-             if request.url.path != "/health":
-                 # Return JSON response for 401
-                 from fastapi.responses import JSONResponse
-                 return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    # Auth Logic
+    api_key = request.headers.get("x-api-key") or request.headers.get("Authorization")
+    if api_key and api_key.startswith("Bearer "):
+        api_key = api_key.split(" ")[1]
+
+    valid = False
+
+    # 1. Check legacy token
+    if settings.rag_api_token and api_key and api_key == settings.rag_api_token.get_secret_value():
+        valid = True
+
+    # 2. Check key list
+    if not valid and settings.rag_api_keys and api_key:
+        for k in settings.rag_api_keys:
+            if api_key == k.get_secret_value():
+                valid = True
+                break
+
+    # 3. If no auth configured, allow
+    if not settings.rag_api_token and not settings.rag_api_keys:
+        valid = True
+
+    if not valid:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    # Rate Limiting
+    if api_key and not check_rate_limit(api_key):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
 
     response = await call_next(request)
     return response
@@ -111,13 +152,13 @@ async def trigger_indexing(req: IndexRequest, background_tasks: BackgroundTasks)
     if not os.path.isdir(req.path):
         raise HTTPException(status_code=400, detail="Invalid path")
 
+    # TODO: Add logic to handle 'mode' if requested, currently assumes incremental based on force flag
     background_tasks.add_task(run_indexing, req.path, req.force)
     return {"status": "indexing_started", "path": req.path}
 
 def run_indexing(path: str, force: bool):
     logger.info(f"Starting indexing for {path}")
     try:
-        # FileIndexer.index_workspace now handles repo map generation and persistence
         stats = indexer.index_workspace(path, force=force)
         logger.info(f"Indexing complete: {stats}")
     except Exception as e:
@@ -151,10 +192,8 @@ async def query_codebase(req: QueryRequest):
         except Exception as e:
             logger.error(f"Workflow failed: {e}, falling back to standard search.")
 
-    # 3. Standard Retrieval & Answer (CODE/GENERAL or Fallback)
+    # 3. Standard Retrieval & Answer
     results = retriever.retrieve(req.query, k=req.k)
-
-    # 4. Answer
     output = answer_engine.answer(req.query, results)
 
     return QueryResponse(
@@ -162,9 +201,44 @@ async def query_codebase(req: QueryRequest):
         citations=output["citations"]
     )
 
-# --- MCP Support (Optional Mode) ---
-# This endpoint acts as a simple MCP server over HTTP.
-# Real MCP usually runs over Stdio or SSE, but HTTP is fine for tools.
+@app.post("/query_stream")
+async def query_stream_endpoint(req: QueryRequest):
+    if not retriever or not answer_engine:
+         raise HTTPException(status_code=503, detail="Not initialized")
+
+    async def event_generator():
+        yield json.dumps({"type": "retrieval_start", "query": req.query}) + "\n"
+
+        try:
+            results = retriever.retrieve(req.query, k=req.k)
+
+            items = []
+            for r in results:
+                items.append({
+                    "path": r.node.filepath,
+                    "lines": [r.node.start_line, r.node.end_line],
+                    "score": r.score,
+                    "route": r.node.next_route_path,
+                    "segment": r.node.next_segment_type
+                })
+            yield json.dumps({"type": "retrieval_result", "items": items}) + "\n"
+
+            accumulated_answer = ""
+            stream = answer_engine.answer_stream(req.query, results)
+
+            for chunk in stream:
+                accumulated_answer += chunk
+                yield json.dumps({"type": "generation_chunk", "text": chunk}) + "\n"
+
+            yield json.dumps({"type": "done", "answer": accumulated_answer, "citations": items}) + "\n"
+
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+# --- MCP Support ---
 
 @app.post("/mcp")
 async def mcp_endpoint(req: MCPCallRequest):
@@ -185,58 +259,6 @@ async def mcp_endpoint(req: MCPCallRequest):
                         "lines": [r.node.start_line, r.node.end_line],
                         "score": r.score
                     } for r in results
-                ]
-            },
-            "id": req.id
-        }
-
-    elif req.method == "rag.explain":
-        # Simplified explain: just search and answer
-        symbol = req.params.get("symbol")
-        if not symbol:
-             return {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Missing symbol"}, "id": req.id}
-
-        # Reuse query logic
-        results = retriever.retrieve(f"Explain {symbol}", k=5)
-        output = answer_engine.answer(f"Explain the code symbol '{symbol}'", results)
-
-        return {
-            "jsonrpc": "2.0",
-            "result": {
-                "explanation": output["answer"],
-                "citations": output["citations"]
-            },
-            "id": req.id
-        }
-
-    elif req.method == "list_tools":
-        return {
-            "jsonrpc": "2.0",
-            "result": {
-                "tools": [
-                    {
-                        "name": "rag.search",
-                        "description": "Search the codebase for code snippets.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string"},
-                                "k": {"type": "integer"}
-                            },
-                            "required": ["query"]
-                        }
-                    },
-                    {
-                        "name": "rag.explain",
-                        "description": "Explain a symbol or file.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "symbol": {"type": "string"}
-                            },
-                            "required": ["symbol"]
-                        }
-                    }
                 ]
             },
             "id": req.id
