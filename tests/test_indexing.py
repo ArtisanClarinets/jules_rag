@@ -20,7 +20,7 @@ class TestIndexing(unittest.TestCase):
     def test_index_python_file(self):
         filepath = os.path.join(self.test_dir, "hello.py")
         with open(filepath, "w") as f:
-            f.write("def hello():\n    print('world')\n")
+            f.write("def hello():\n    print('world')\n    return True\n")
 
         stats = self.indexer.index_workspace(self.test_dir)
         # Note: Stats counts files, not nodes. 1 file processed.
