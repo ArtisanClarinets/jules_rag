@@ -77,7 +77,11 @@ class ANNIndex:
             os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
             self.index.save_index(self.index_path)
             with open(self.index_path + ".map", "wb") as f:
-                pickle.dump(self.id_map, f)
+    # Use JSON for serialization instead of pickle to avoid code execution vulnerabilities
+    import json
+
+    # If self.id_map has non-string keys (such as int), convert them to strings for JSON compatibility
+    json.dump({str(k): v for k, v in self.id_map.items()}, f)
             logger.info("Saved ANN index.")
         except Exception as e:
             logger.error(f"Failed to save ANN index: {e}")
