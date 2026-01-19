@@ -91,7 +91,10 @@ class ANNIndex:
 
         try:
             with open(self.index_path + ".map", "rb") as f:
-                self.id_map = pickle.load(f)
+        import json  # Ensure json is imported at the top of the file
+
+        # Load id_map from JSON and convert string keys back to int if necessary
+        self.id_map = {int(k): v for k, v in json.load(f).items()}
 
             p = self.hnswlib.Index(space='cosine', dim=self.dim)
             p.load_index(self.index_path, max_elements=len(self.id_map))
