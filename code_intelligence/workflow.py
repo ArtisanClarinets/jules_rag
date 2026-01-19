@@ -2,7 +2,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
-from .provider import LLMInterface
+from .providers import LLMInterface
 from .retrieval import RetrievalEngine, SearchResult
 
 logger = logging.getLogger(__name__)
