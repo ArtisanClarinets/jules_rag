@@ -55,6 +55,10 @@ A production-grade RAG engine optimized for **Next.js App Router** repositories.
    ```bash
    make prod
    ```
+   This will start:
+   - Vantus API (Vector DB Manager) on `/api`
+   - Vantus Web (Admin UI) on `/`
+   - Code Intelligence RAG Engine on `/rag`
 
 ## Architecture
 
