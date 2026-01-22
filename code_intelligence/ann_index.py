@@ -1,6 +1,6 @@
 import os
 import logging
-import pickle
+import json
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 
@@ -76,12 +76,9 @@ class ANNIndex:
         try:
             os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
             self.index.save_index(self.index_path)
-            with open(self.index_path + ".map", "wb") as f:
-    # Use JSON for serialization instead of pickle to avoid code execution vulnerabilities
-    import json
-
-    # If self.id_map has non-string keys (such as int), convert them to strings for JSON compatibility
-    json.dump({str(k): v for k, v in self.id_map.items()}, f)
+            with open(self.index_path + ".map", "w", encoding="utf-8") as f:
+                 # If self.id_map has non-string keys (such as int), convert them to strings for JSON compatibility
+                 json.dump({str(k): v for k, v in self.id_map.items()}, f)
             logger.info("Saved ANN index.")
         except Exception as e:
             logger.error(f"Failed to save ANN index: {e}")
@@ -94,11 +91,9 @@ class ANNIndex:
             return False
 
         try:
-            with open(self.index_path + ".map", "rb") as f:
-        import json  # Ensure json is imported at the top of the file
-
-        # Load id_map from JSON and convert string keys back to int if necessary
-        self.id_map = {int(k): v for k, v in json.load(f).items()}
+            with open(self.index_path + ".map", "r", encoding="utf-8") as f:
+                # Load id_map from JSON and convert string keys back to int
+                self.id_map = {int(k): v for k, v in json.load(f).items()}
 
             p = self.hnswlib.Index(space='cosine', dim=self.dim)
             p.load_index(self.index_path, max_elements=len(self.id_map))

@@ -189,6 +189,24 @@ services:
       - internal
     <<: *logging
 
+  rag-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.rag
+    container_name: vantus-rag-engine
+    restart: always
+    environment:
+      - DB_PATH=/data/codegraph.db
+      - RAG_MAX_FILE_MB=2
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+    volumes:
+      - ${DATA_DIR:-./data}/rag:/data
+    networks:
+      - internal
+    <<: *logging
+
   # ---------------------------------------------------------------------------
   # INFERENCE SERVICES (PROFILES)
   # ---------------------------------------------------------------------------
