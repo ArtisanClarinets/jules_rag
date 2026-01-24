@@ -12,12 +12,14 @@ from tree_sitter_languages import get_parser
 from .db import Database, CodeNode
 from .config import settings
 from .next_semantics import derive_next_route, get_segment_type, detect_next_directives
+from .providers.llm import LLMInterface
 
 logger = logging.getLogger(__name__)
 
 class FileIndexer:
     def __init__(self, db: Database):
         self.db = db
+        self.llm = LLMInterface()
         self.supported_extensions = {
             ".py": "python",
             ".js": "javascript",
@@ -169,12 +171,14 @@ class FileIndexer:
 
             symbols = []
             if should_index:
-                nodes, symbols = self._parse_file_content(
+                nodes, symbols, edges = self._parse_file_content(
                     full_path, rel_path, content,
                     next_route, segment_type, is_client, is_server, is_route_handler, runtime, file_hash
                 )
                 self.db.delete_nodes_by_filepath(full_path)
                 self.db.batch_add_nodes(nodes)
+                for src, tgt, rel, props in edges:
+                    self.db.add_edge(src, tgt, rel, props)
                 self.db.set_file_hash(full_path, file_hash)
             else:
                 should_index = False
@@ -210,12 +214,13 @@ class FileIndexer:
     def _parse_file_content(self, full_path: str, rel_path: str, content: str,
                            next_route: Optional[str], segment_type: Optional[str],
                            is_client: bool, is_server: bool, is_route_handler: bool, runtime: str,
-                           file_hash: str) -> Tuple[List[CodeNode], List[Dict[str, Any]]]:
+                           file_hash: str) -> Tuple[List[CodeNode], List[Dict[str, Any]], List[Tuple]]:
         ext = os.path.splitext(full_path)[1].lower()
         lang = self.supported_extensions.get(ext)
 
         nodes = []
         symbols = []
+        edges = []
 
         common_metadata = {
             "next_route_path": next_route,
@@ -229,7 +234,7 @@ class FileIndexer:
 
         if not lang:
             node = self._create_node(full_path, content, 0, len(content.splitlines()), "text", "file", **common_metadata)
-            return [node], []
+            return [node], [], []
 
         try:
             parser = get_parser(lang)
@@ -283,10 +288,27 @@ class FileIndexer:
 
                     if name and (is_exported or is_top_level):
                         # Filter out small things?
-                        if (node.end_point[0] - node.start_point[0]) < 2 and not is_exported:
+                        lines_count = node.end_point[0] - node.start_point[0]
+                        if lines_count < 2 and not is_exported:
                              pass # Skip small non-exported
                         else:
                             sig_line = content.splitlines()[node.start_point[0]]
+
+                            # Agentic Summary for Complex Blocks
+                            summary = None
+                            if lines_count > 15:
+                                try:
+                                    chunk_text = self._get_text(node, content)
+                                    prompt = f"Analyze this code block from {rel_path}:\n\n{chunk_text}\n\nProvide a 1-sentence semantic summary of what this code DOES (not just what it is). Return JSON {{'summary': '...'}}"
+                                    resp = self.llm.generate_response(prompt, json_mode=True)
+                                    data = json.loads(resp)
+                                    summary = data.get("summary")
+                                except Exception:
+                                    pass
+
+                            props = common_metadata.copy()
+                            if summary:
+                                props["semantic_summary"] = summary
 
                             code_node = self._create_node(
                                 full_path,
@@ -295,11 +317,45 @@ class FileIndexer:
                                 node.end_point[0],
                                 node.type,
                                 name,
-                                **common_metadata
+                                **props
                             )
 
                             if not any(n.id == code_node.id for n in nodes):
                                 nodes.append(code_node)
+
+                            # Extract Graph Edges (Calls & Types)
+                            # Heuristic: Regex search in chunk text
+                            chunk_text = self._get_text(node, content)
+
+                            # 1. Calls (func_name(...))
+                            # Regex matches word characters followed by ( but excludes keywords
+                            calls = set(re.findall(r'\b(?!(?:if|for|while|switch|catch|return|await|async|def|class|function)\b)(\w+)\s*\(', chunk_text))
+
+                            # 2. Type Usage ( : Type, -> Type, new Type)
+                            # Naive regex for capitalized words likely to be types
+                            type_usages = set(re.findall(r':\s*([A-Z]\w+)', chunk_text))
+                            type_usages.update(re.findall(r'->\s*([A-Z]\w+)', chunk_text))
+                            type_usages.update(re.findall(r'new\s+([A-Z]\w+)', chunk_text))
+
+                            # Store edges. Note: We use "symbol:<name>" as target_id.
+                            # SQLite FKs are off by default in db.py, so this works.
+                            for called_func in calls:
+                                if called_func != name and len(called_func) > 2:
+                                    edges.append((
+                                        code_node.id,
+                                        f"symbol:{called_func}",
+                                        "calls",
+                                        {"target_name": called_func, "resolved": False}
+                                    ))
+
+                            for type_name in type_usages:
+                                if type_name != name and len(type_name) > 2:
+                                    edges.append((
+                                        code_node.id,
+                                        f"symbol:{type_name}",
+                                        "uses_type",
+                                        {"target_name": type_name, "resolved": False}
+                                    ))
 
                             symbols.append({
                                 "name": name,
@@ -316,12 +372,12 @@ class FileIndexer:
                     traverse(child)
 
             traverse(tree.root_node)
-            return nodes, symbols
+            return nodes, symbols, edges
 
         except Exception as e:
             logger.warning(f"Parsing failed for {full_path}: {e}")
             nodes = [self._create_node(full_path, content, 0, len(content.splitlines()), "text", "file", **common_metadata)]
-            return nodes, symbols
+            return nodes, symbols, edges
 
     def _extract_imports(self, tree, lang, full_path) -> List[str]:
         imports = set()
