@@ -1,5 +1,9 @@
 import os
+import re
+import json
 from apps.worker.ingestion.utils import clone_repo, cleanup_dir
+from apps.api.services.llm import generate_text_sync
+
 try:
     from tree_sitter_languages import get_language, get_parser
     HAS_TREE_SITTER = True
@@ -84,15 +88,47 @@ def chunk_file_semantic(content: str, filepath: str, lang: str):
                  end_line = child.end_point[0]
                  text = content.splitlines()[start_line:end_line+1]
 
-                 chunks.append({
-                    "text": "\n".join(text),
-                    "metadata": {
+                 chunk_content = "\n".join(text)
+
+                 # Agentic: Verify & Summarize
+                 summary = None
+                 # Heuristic: only summarize "complex" blocks (>15 lines)
+                 if len(text) > 15:
+                     try:
+                        prompt = f"Analyze this code block from {filepath}:\n\n{chunk_content}\n\nProvide a 1-sentence semantic summary. Return JSON {{'summary': '...'}}"
+                        # Simple JSON extraction
+                        resp = generate_text_sync(prompt, system_prompt="You are a coding expert. Return valid JSON.", temperature=0.0)
+                        # Attempt to parse JSON
+                        match = re.search(r"\{.*\}", resp, re.DOTALL)
+                        if match:
+                             data = json.loads(match.group(0))
+                             summary = data.get("summary")
+                     except Exception as e:
+                        print(f"Agentic summary failed: {e}")
+                        pass
+
+                 # Graph Extraction (Heuristic)
+                 calls = list(set(re.findall(r'\b(?!(?:if|for|while|switch|catch|return|await|async|def|class|function)\b)(\w+)\s*\(', chunk_content)))
+                 type_usages = list(set(re.findall(r':\s*([A-Z]\w+)', chunk_content) +
+                                        re.findall(r'->\s*([A-Z]\w+)', chunk_content) +
+                                        re.findall(r'new\s+([A-Z]\w+)', chunk_content)))
+
+                 metadata = {
                         "filepath": filepath,
                         "start_line": start_line + 1,
                         "end_line": end_line + 1,
                         "lang": lang,
-                        "type": child.type
-                    }
+                        "type": child.type,
+                        "outgoing_calls": calls,
+                        "used_types": type_usages
+                 }
+
+                 if summary:
+                     metadata["semantic_summary"] = summary
+
+                 chunks.append({
+                    "text": chunk_content,
+                    "metadata": metadata
                  })
 
         # If no semantic blocks found (e.g. script), fallback to window

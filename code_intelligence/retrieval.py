@@ -75,6 +75,9 @@ class RetrievalEngine:
             if ex.node.id not in existing_ids:
                 candidates.append(ex)
 
+        # Centrality Boosting
+        self._boost_centrality(candidates)
+
         candidates.sort(key=lambda x: x.score, reverse=True)
 
         # 4. Rerank (LLM)
@@ -160,6 +163,11 @@ class RetrievalEngine:
         self._cache_timestamp = time.time()
 
     def _expand_graph(self, candidates: List[SearchResult], limit: int) -> List[SearchResult]:
+        """
+        Deep Graph Traversal:
+        1. Fetch definitions of types used in the function (uses_type).
+        2. Fetch callers of the function (calls).
+        """
         expanded = []
         seen = {c.node.id for c in candidates}
         seeds = candidates[:3]
@@ -169,27 +177,62 @@ class RetrievalEngine:
 
         try:
             for cand in seeds:
-                filename = os.path.basename(cand.node.filepath)
-                filename_no_ext = os.path.splitext(filename)[0]
+                # Hop 1: Definitions of types used (outgoing edges)
+                cursor.execute("SELECT target_id FROM edges WHERE source_id = ? AND relationship = 'uses_type'", (cand.node.id,))
+                type_targets = [row[0] for row in cursor.fetchall()]
 
-                # Check for files that import this one (naive LIKE check)
-                cursor.execute(
-                    "SELECT id FROM nodes WHERE import_deps LIKE ? LIMIT ?",
-                    (f"%{filename_no_ext}%", limit)
-                )
-                rows = cursor.fetchall()
-                for (nid,) in rows:
-                    if nid not in seen:
-                         node = self.db.get_node(nid)
-                         if node:
-                             expanded.append(SearchResult(node, cand.score * 0.5, "graph-neighbor"))
-                             seen.add(nid)
-        except Exception:
-            pass
+                for target_id in type_targets:
+                    if target_id.startswith("symbol:"):
+                        type_name = target_id.split(":", 1)[1]
+                        # Find node defining this type
+                        cursor.execute("SELECT id FROM nodes WHERE name = ? LIMIT 1", (type_name,))
+                        row = cursor.fetchone()
+                        if row:
+                            nid = row[0]
+                            if nid not in seen:
+                                node = self.db.get_node(nid)
+                                if node:
+                                    expanded.append(SearchResult(node, cand.score * 0.4, f"defines-type:{type_name}"))
+                                    seen.add(nid)
+
+                # Hop 2: Callers (incoming edges)
+                # target_id = symbol:<name>
+                symbol_id = f"symbol:{cand.node.name}"
+                cursor.execute("SELECT source_id FROM edges WHERE target_id = ? AND relationship = 'calls' LIMIT ?", (symbol_id, limit))
+                caller_ids = [row[0] for row in cursor.fetchall()]
+
+                for cid in caller_ids:
+                    if cid not in seen:
+                        node = self.db.get_node(cid)
+                        if node:
+                            expanded.append(SearchResult(node, cand.score * 0.5, "caller"))
+                            seen.add(cid)
+
+        except Exception as e:
+            logger.error(f"Graph traversal failed: {e}")
         finally:
             conn.close()
 
         return expanded
+
+    def _boost_centrality(self, candidates: List[SearchResult]):
+        """Boost score of nodes that are highly referenced (central)."""
+        conn = self.db._get_conn()
+        cursor = conn.cursor()
+        try:
+            for cand in candidates:
+                symbol_id = f"symbol:{cand.node.name}"
+                cursor.execute("SELECT COUNT(*) FROM edges WHERE target_id = ? AND relationship = 'calls'", (symbol_id,))
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    # Logarithmic boost
+                    boost = 1.0 + (0.1 * np.log(1 + count))
+                    cand.score *= boost
+                    cand.reason += f" +centrality({count})"
+        except Exception:
+            pass
+        finally:
+            conn.close()
 
     def _mmr(self, query_vec: Optional[np.ndarray], candidates: List[SearchResult], k: int) -> List[SearchResult]:
         if query_vec is None or not candidates:
