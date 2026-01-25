@@ -102,6 +102,16 @@ class MCPCallRequest(BaseModel):
     params: Dict[str, Any] = {}
     id: Optional[Any] = None
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "vantus-rag"
+    messages: List[ChatMessage]
+    stream: bool = False
+    temperature: float = 0.0
+
 # --- Middleware ---
 
 @app.middleware("http")
@@ -265,6 +275,92 @@ async def mcp_endpoint(req: MCPCallRequest):
         }
 
     return {"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": req.id}
+
+# --- OpenAI Compatible Endpoint ---
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(req: ChatCompletionRequest):
+    if not retriever or not answer_engine:
+         raise HTTPException(status_code=503, detail="Not initialized")
+
+    # Extract query from last user message
+    query = next((m.content for m in reversed(req.messages) if m.role == "user"), None)
+    if not query:
+        raise HTTPException(status_code=400, detail="No user message found")
+
+    if req.stream:
+        async def stream_generator():
+            request_id = f"chatcmpl-{int(time.time())}"
+            created = int(time.time())
+
+            # 1. Retrieval
+            # We don't stream retrieval steps in OpenAI format usually, just the delta content
+            results = retriever.retrieve(query, k=5)
+
+            # 2. Generation
+            stream = answer_engine.answer_stream(query, results)
+
+            for chunk in stream:
+                data = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": chunk},
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+
+            # Final done message
+            data = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }
+                    ]
+                }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    else:
+        # Non-streaming
+        results = retriever.retrieve(query, k=5)
+        output = answer_engine.answer(query, results)
+
+        return {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": output["answer"]
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0, # Calculation complex without tokenizer
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
+        }
 
 if __name__ == "__main__":
     import uvicorn
