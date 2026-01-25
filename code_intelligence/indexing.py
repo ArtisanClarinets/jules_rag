@@ -8,11 +8,12 @@ from typing import List, Dict, Any, Generator, Optional, Set, Tuple
 
 from pathspec import PathSpec
 from tree_sitter_languages import get_parser
+import numpy as np
 
 from .db import Database, CodeNode
 from .config import settings
 from .next_semantics import derive_next_route, get_segment_type, detect_next_directives
-from .providers.llm import LLMInterface
+from .providers import LLMInterface, EmbeddingsInterface
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class FileIndexer:
 
             for file in files:
                 full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, root_path)
+                rel_path = os.path.join(rel_root, file) # Use os.path.join for correct separators
 
                 if is_ignored_func(full_path):
                     continue
@@ -130,7 +131,70 @@ class FileIndexer:
         self.db.store_repo_map(run_id, repo_map_payload, repo_map_entries)
         self.db.complete_index_run(run_id, "success")
 
+        # Trigger Embedding Generation & Index Rebuild
+        self._generate_embeddings()
+
         return stats
+
+    def _generate_embeddings(self):
+        """Generate embeddings for chunks that don't have them and rebuild index."""
+        logger.info("Generating embeddings for new chunks...")
+
+        model = settings.embeddings_model
+        nodes = self.db.get_chunks_without_embeddings(model)
+
+        if nodes:
+            logger.info(f"Found {len(nodes)} chunks to embed with {model}")
+            embeddings_interface = EmbeddingsInterface()
+
+            if embeddings_interface.client:
+                batch_size = 32
+                for i in range(0, len(nodes), batch_size):
+                    batch = nodes[i : i + batch_size]
+                    texts = []
+                    for n in batch:
+                        text = n.content
+                        if n.properties.get("semantic_summary"):
+                            text = f"{n.properties['semantic_summary']}\n{text}"
+                        texts.append(text)
+
+                    try:
+                        vectors = embeddings_interface.embed(texts)
+                        updates = []
+                        for node, vec in zip(batch, vectors):
+                            updates.append((node.id, vec, model))
+
+                        self.db.upsert_embeddings_batch(updates)
+                        if (i // batch_size) % 5 == 0:
+                             logger.info(f"Embedded batch {i // batch_size + 1}/{(len(nodes) + batch_size - 1) // batch_size}")
+                    except Exception as e:
+                        logger.error(f"Embedding batch failed: {e}")
+            else:
+                logger.warning("No embedding provider configured, skipping dense vector generation.")
+        else:
+            logger.info("All chunks already embedded.")
+
+        # Rebuild ANN Index
+        from .ann_index import ANNIndex
+
+        vector_path = os.path.join(os.path.dirname(settings.db_path), "vectors.bin")
+        ann_index = ANNIndex(vector_path)
+
+        logger.info("Fetching all embeddings to rebuild ANN index...")
+        conn = self.db._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_id, vector FROM embeddings WHERE model = ?", (model,))
+        rows = cursor.fetchall()
+        conn.close()
+
+        if rows:
+            ids = [r[0] for r in rows]
+            vecs = [np.frombuffer(r[1], dtype=np.float32) for r in rows]
+            matrix = np.vstack(vecs)
+            ann_index.build(matrix, ids)
+            logger.info(f"ANN index rebuilt with {len(ids)} vectors.")
+        else:
+            logger.info("No embeddings found, skipping ANN build.")
 
     def _process_file(self, full_path: str, rel_path: str, force: bool) -> Tuple[bool, List[Dict[str, Any]]]:
         try:
@@ -138,10 +202,10 @@ class FileIndexer:
                 content = f.read()
 
             file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            existing_hash = self.db.get_file_hash(full_path)
-
-            # Simple git_sha check if it's a git repo (not implemented fully here, assuming file hash is enough)
-            # We could use `git hash-object` but internal hash is faster.
+            # Check hash using rel_path?
+            # The get_file_hash usually expects filepath stored in DB.
+            # If we switch to rel_path in DB, we should pass rel_path here.
+            existing_hash = self.db.get_file_hash(rel_path)
 
             should_index = force or (existing_hash != file_hash)
 
@@ -171,19 +235,20 @@ class FileIndexer:
 
             symbols = []
             if should_index:
+                # Use rel_path for node creation and deletion
                 nodes, symbols, edges = self._parse_file_content(
                     full_path, rel_path, content,
                     next_route, segment_type, is_client, is_server, is_route_handler, runtime, file_hash
                 )
-                self.db.delete_nodes_by_filepath(full_path)
+                self.db.delete_nodes_by_filepath(rel_path)
                 self.db.batch_add_nodes(nodes)
                 for src, tgt, rel, props in edges:
                     self.db.add_edge(src, tgt, rel, props)
-                self.db.set_file_hash(full_path, file_hash)
+                self.db.set_file_hash(rel_path, file_hash)
             else:
                 should_index = False
-                # Retrieve existing nodes for map
-                old_nodes = self.db.get_nodes_by_filepath(full_path)
+                # Retrieve existing nodes for map using rel_path
+                old_nodes = self.db.get_nodes_by_filepath(rel_path)
                 for n in old_nodes:
                      if n.type != "file":
                         symbols.append({
@@ -232,8 +297,9 @@ class FileIndexer:
             "file_hash": file_hash,
         }
 
+        # Note: we pass rel_path to _create_node for filepath
         if not lang:
-            node = self._create_node(full_path, content, 0, len(content.splitlines()), "text", "file", **common_metadata)
+            node = self._create_node(rel_path, content, 0, len(content.splitlines()), "text", "file", **common_metadata)
             return [node], [], []
 
         try:
@@ -245,13 +311,8 @@ class FileIndexer:
             common_metadata["import_deps"] = import_deps
 
             # Root Node
-            root_node = self._create_node(full_path, content, 0, len(content.splitlines()), "file", os.path.basename(full_path), **common_metadata)
+            root_node = self._create_node(rel_path, content, 0, len(content.splitlines()), "file", os.path.basename(rel_path), **common_metadata)
             nodes.append(root_node)
-
-            # Chunking Strategy:
-            # 1. Exported Symbols (Class, Func, Const)
-            # 2. Top-level blocks if not covered
-            # 3. No JSX Element standalone chunks
 
             relevant_types = {
                 "function_definition", "class_definition", "method_definition", # Python
@@ -266,20 +327,14 @@ class FileIndexer:
                 # Check for exported symbols or top-level definitions
                 is_exported = False
 
-                # Check if wrapped in export_statement
                 if node.parent and node.parent.type == "export_statement":
                     is_exported = True
 
                 if node.type in relevant_types:
                     name = self._get_node_name(node, content)
 
-                    # For variable declarations, we only care if they are likely components or exported
-                    # or if they are top-level.
-                    # Heuristic: index top-level functions/classes/consts.
-
                     is_top_level = (node.parent.type == "program" or node.parent.type == "module" or node.parent.type == "export_statement")
 
-                    # Fix: Arrow functions often don't have name directly, look at parent
                     if node.type == "arrow_function" and not name:
                         if node.parent.type == "variable_declarator":
                             name = self._get_node_name(node.parent, content)
@@ -287,19 +342,18 @@ class FileIndexer:
                                 is_exported = True
 
                     if name and (is_exported or is_top_level):
-                        # Filter out small things?
                         lines_count = node.end_point[0] - node.start_point[0]
                         if lines_count < 2 and not is_exported:
-                             pass # Skip small non-exported
+                             pass
                         else:
                             sig_line = content.splitlines()[node.start_point[0]]
 
-                            # Agentic Summary for Complex Blocks
                             summary = None
                             if lines_count > 15:
                                 try:
                                     chunk_text = self._get_text(node, content)
                                     prompt = f"Analyze this code block from {rel_path}:\n\n{chunk_text}\n\nProvide a 1-sentence semantic summary of what this code DOES (not just what it is). Return JSON {{'summary': '...'}}"
+                                    # Use LLMInterface but catch errors
                                     resp = self.llm.generate_response(prompt, json_mode=True)
                                     data = json.loads(resp)
                                     summary = data.get("summary")
@@ -311,7 +365,7 @@ class FileIndexer:
                                 props["semantic_summary"] = summary
 
                             code_node = self._create_node(
-                                full_path,
+                                rel_path,
                                 content,
                                 node.start_point[0],
                                 node.end_point[0],
@@ -323,22 +377,12 @@ class FileIndexer:
                             if not any(n.id == code_node.id for n in nodes):
                                 nodes.append(code_node)
 
-                            # Extract Graph Edges (Calls & Types)
-                            # Heuristic: Regex search in chunk text
                             chunk_text = self._get_text(node, content)
-
-                            # 1. Calls (func_name(...))
-                            # Regex matches word characters followed by ( but excludes keywords
                             calls = set(re.findall(r'\b(?!(?:if|for|while|switch|catch|return|await|async|def|class|function)\b)(\w+)\s*\(', chunk_text))
-
-                            # 2. Type Usage ( : Type, -> Type, new Type)
-                            # Naive regex for capitalized words likely to be types
                             type_usages = set(re.findall(r':\s*([A-Z]\w+)', chunk_text))
                             type_usages.update(re.findall(r'->\s*([A-Z]\w+)', chunk_text))
                             type_usages.update(re.findall(r'new\s+([A-Z]\w+)', chunk_text))
 
-                            # Store edges. Note: We use "symbol:<name>" as target_id.
-                            # SQLite FKs are off by default in db.py, so this works.
                             for called_func in calls:
                                 if called_func != name and len(called_func) > 2:
                                     edges.append((
@@ -364,8 +408,6 @@ class FileIndexer:
                                 "end_line": node.end_point[0],
                                 "signature": sig_line.strip()
                             })
-
-                            # Do not traverse children of indexed chunks (don't split components into JSX chunks)
                             return
 
                 for child in node.children:
@@ -376,63 +418,40 @@ class FileIndexer:
 
         except Exception as e:
             logger.warning(f"Parsing failed for {full_path}: {e}")
-            nodes = [self._create_node(full_path, content, 0, len(content.splitlines()), "text", "file", **common_metadata)]
+            nodes = [self._create_node(rel_path, content, 0, len(content.splitlines()), "text", "file", **common_metadata)]
             return nodes, symbols, edges
 
     def _extract_imports(self, tree, lang, full_path) -> List[str]:
         imports = set()
-        # Basic traversal for imports
-        # Optimization: use tree-sitter query
-        # For now, traverse
 
         def visit(n):
             if n.type == "import_statement":
-                # import ... from "source"
-                # source is usually a string node
                 for child in n.children:
                     if child.type == "string":
                         src = child.text.decode("utf-8").strip('"\'')
                         imports.add(src)
-                    elif child.type == "import_clause":
-                         # import { x } from "source"
-                         # Traverse siblings/children for string
-                         pass
-
-                # Search for string in children (JS/TS)
-                # (import_statement (string) @source)
-                # Actually usually it is last child
-
-                # Hacky: look for string literal in children
                 for c in n.children:
                     if c.type == "string":
                         imports.add(c.text.decode("utf-8").strip('"\''))
-
-            elif n.type == "import_from_statement": # Python
-                # from module import ...
+            elif n.type == "import_from_statement":
                 for c in n.children:
                      if c.type == "dotted_name":
                          imports.add(c.text.decode("utf-8"))
                          break
-
             for c in n.children:
                 visit(c)
 
         visit(tree.root_node)
 
-        # Resolve imports relative to file
         resolved = []
-        base_dir = os.path.dirname(full_path)
+        base_dir = os.path.dirname(full_path) # still need full_path for resolving relative imports
 
         for imp in imports:
             if imp.startswith("."):
-                # Relative import
-                # We won't fully resolve extensions here, just path
                 try:
-                    res = os.path.normpath(os.path.join(base_dir, imp))
-                    # Make relative to repo root if possible, or keep absolute?
-                    # Let's store raw string for now, user asked for "import specifiers + resolved local targets when possible"
-                    # "JSON list of import specifiers + resolved"
-                    # I'll store "specifier"
+                    # We store the specifier, maybe we can resolve it to rel_path?
+                    # The user prompt mentions "metadata (repo-relative path, ... imports)".
+                    # Storing just specifier is fine for now.
                     resolved.append(imp)
                 except Exception:
                     resolved.append(imp)
@@ -469,6 +488,7 @@ class FileIndexer:
         start_line = max(0, start_line)
         end_line = min(len(lines), end_line)
         chunk_content = "\n".join(lines[start_line : end_line + 1])
+        # Unique ID now uses relative path
         node_id = f"{filepath}:{start_line}-{end_line}"
 
         props = {"language": os.path.splitext(filepath)[1]}
@@ -484,7 +504,6 @@ class FileIndexer:
             end_line=end_line,
             content=chunk_content,
             properties=props,
-            # Kwargs match the new fields in CodeNode
             next_route_path=kwargs.get("next_route_path"),
             next_segment_type=kwargs.get("next_segment_type"),
             next_use_client=kwargs.get("next_use_client", False),
@@ -501,7 +520,6 @@ class FileIndexer:
         default_ignores = {
             ".git", "node_modules", "dist", "build", "out", "__pycache__",
             ".venv", "venv", ".pytest_cache", ".vscode", ".idea", "site-packages",
-            # Secrets
             ".env", ".env.*", "*.pem", "*.key", "*.cert", "*.crt", "id_rsa", "id_dsa"
         }
         for g in settings.rag_deny_globs:

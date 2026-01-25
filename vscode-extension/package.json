@@ -2,7 +2,7 @@
   "name": "advanced-code-intelligence",
   "publisher": "code-council",
   "displayName": "Advanced Code Intelligence RAG",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Self-optimizing, multi-layered RAG system for VS Code",
   "engines": {
     "vscode": "^1.85.0"
@@ -24,6 +24,11 @@
           "type": "string",
           "default": "http://localhost:8000",
           "description": "Base URL for the local Code Council API server (python api/server.py)."
+        },
+        "codeCouncil.apiToken": {
+          "type": "string",
+          "default": "",
+          "description": "API Token for the Code Intelligence server (if configured)"
         }
       }
     },
