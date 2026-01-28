@@ -2,6 +2,7 @@ import asyncio
 import uuid
 import os
 import boto3
+import tempfile
 from apps.api.core.config import settings
 from apps.worker.ingestion.code import process_repo
 from apps.worker.ingestion.doc import process_pdf
@@ -93,28 +94,32 @@ async def ingest_doc(ctx, job_id: str, source_id: str, file_path: str, collectio
     local_path = None
     try:
         # 0. Download from S3 if needed
-        # Assume if it looks like a key (contains /) or we want to try S3 first
-        # But for local dev it might be a path.
-        # However, the API now returns a key.
         s3 = get_s3_client()
-        local_path = f"/tmp/{os.path.basename(file_path)}"
+
+        # Create a secure temp file
+        # Use a suffix if possible to help processing tools identify type
+        _, ext = os.path.splitext(file_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
+            local_path = tmp_file.name
 
         try:
              s3.download_file(BUCKET_NAME, file_path, local_path)
              print(f"Downloaded {file_path} to {local_path}")
         except Exception as e:
-             # Fallback: maybe it IS a local path (if manually triggered)?
-             # Or if bucket fails.
-             print(f"S3 download failed ({e}), assuming local path or failing.")
-             if not os.path.exists(file_path):
-                 if os.path.exists(local_path):
-                     pass # Downloaded
-                 else:
-                     raise Exception(f"File not found: {file_path}")
-             else:
+             print(f"S3 download failed ({e}). Checking local fallback.")
+             # If S3 failed, check if it's a valid local path (fallback)
+             # But first delete the empty temp file we created
+             if os.path.exists(local_path):
+                 os.remove(local_path)
+                 local_path = None
+
+             if os.path.exists(file_path):
                  local_path = file_path
+             else:
+                 raise Exception(f"File not found on S3 or locally: {file_path}")
 
         # 1. Process PDF
+        # Note: local_path is now either the temp file or the original file_path
         chunks = await asyncio.to_thread(process_pdf, local_path)
 
         texts = [c["text"] for c in chunks]
@@ -144,8 +149,14 @@ async def ingest_doc(ctx, job_id: str, source_id: str, file_path: str, collectio
         update_job_status(job_id, "failed")
         raise e
     finally:
-        if local_path and os.path.exists(local_path) and local_path.startswith("/tmp/"):
-            try:
-                os.remove(local_path)
-            except:
-                pass
+        # Cleanup temp file if we created one (i.e. it's in /tmp/ and distinct from input)
+        # tempfile.NamedTemporaryFile typically puts files in /tmp/ (or OS equivalent)
+        if local_path and os.path.exists(local_path):
+             # Only delete if it looks like the temp file we created (not the source if fallback)
+             # A simple heuristic: if it starts with tempdir.
+             temp_dir = tempfile.gettempdir()
+             if local_path.startswith(temp_dir):
+                try:
+                    os.remove(local_path)
+                except:
+                    pass
