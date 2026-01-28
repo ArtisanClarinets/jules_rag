@@ -2,6 +2,8 @@ import os
 import logging
 import json
 import time
+import asyncio
+import threading
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -162,7 +164,6 @@ async def trigger_indexing(req: IndexRequest, background_tasks: BackgroundTasks)
     if not os.path.isdir(req.path):
         raise HTTPException(status_code=400, detail="Invalid path")
 
-    # TODO: Add logic to handle 'mode' if requested, currently assumes incremental based on force flag
     background_tasks.add_task(run_indexing, req.path, req.force)
     return {"status": "indexing_started", "path": req.path}
 
@@ -183,7 +184,7 @@ async def query_codebase(req: QueryRequest):
 
     # 1. Classify
     try:
-        class_res = classifier.classify(req.query)
+        class_res = await asyncio.to_thread(classifier.classify, req.query)
         category = class_res.get("category", "CODE")
         logger.info(f"Query classified as: {category} (Reason: {class_res.get('reasoning')})")
     except Exception as e:
@@ -193,7 +194,8 @@ async def query_codebase(req: QueryRequest):
     # 2. Execute Workflow if applicable
     if category in ["PLAN", "DOCS"]:
         try:
-            result = workflow_engine.run(category, req.query)
+            # Workflow engine run is now async
+            result = await workflow_engine.run(category, req.query)
             if result:
                 return QueryResponse(
                     answer=result["answer"],
@@ -203,8 +205,8 @@ async def query_codebase(req: QueryRequest):
             logger.error(f"Workflow failed: {e}, falling back to standard search.")
 
     # 3. Standard Retrieval & Answer
-    results = retriever.retrieve(req.query, k=req.k)
-    output = answer_engine.answer(req.query, results)
+    results = await retriever.retrieve(req.query, k=req.k)
+    output = await asyncio.to_thread(answer_engine.answer, req.query, results)
 
     return QueryResponse(
         answer=output["answer"],
@@ -220,7 +222,7 @@ async def query_stream_endpoint(req: QueryRequest):
         yield json.dumps({"type": "retrieval_start", "query": req.query}) + "\n"
 
         try:
-            results = retriever.retrieve(req.query, k=req.k)
+            results = await retriever.retrieve(req.query, k=req.k)
 
             items = []
             for r in results:
@@ -234,9 +236,27 @@ async def query_stream_endpoint(req: QueryRequest):
             yield json.dumps({"type": "retrieval_result", "items": items}) + "\n"
 
             accumulated_answer = ""
-            stream = answer_engine.answer_stream(req.query, results)
 
-            for chunk in stream:
+            # Run synchronous generator in a separate thread to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            queue = asyncio.Queue()
+
+            def producer():
+                try:
+                    stream = answer_engine.answer_stream(req.query, results)
+                    for chunk in stream:
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                    loop.call_soon_threadsafe(queue.put_nowait, None) # Sentinel
+                except Exception as e:
+                    logger.error(f"Stream generation error: {e}")
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
+
+            threading.Thread(target=producer, daemon=True).start()
+
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
                 accumulated_answer += chunk
                 yield json.dumps({"type": "generation_chunk", "text": chunk}) + "\n"
 
@@ -258,7 +278,7 @@ async def mcp_endpoint(req: MCPCallRequest):
         if not q:
             return {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Missing query"}, "id": req.id}
 
-        results = retriever.retrieve(q, k=k)
+        results = await retriever.retrieve(q, k=k)
         return {
             "jsonrpc": "2.0",
             "result": {
@@ -294,8 +314,7 @@ async def openai_chat_completions(req: ChatCompletionRequest):
             created = int(time.time())
 
             # 1. Retrieval
-            # We don't stream retrieval steps in OpenAI format usually, just the delta content
-            results = retriever.retrieve(query, k=5)
+            results = await retriever.retrieve(query, k=5)
 
             # 2. Generation
             stream = answer_engine.answer_stream(query, results)
@@ -337,8 +356,8 @@ async def openai_chat_completions(req: ChatCompletionRequest):
 
     else:
         # Non-streaming
-        results = retriever.retrieve(query, k=5)
-        output = answer_engine.answer(query, results)
+        results = await retriever.retrieve(query, k=5)
+        output = await asyncio.to_thread(answer_engine.answer, query, results)
 
         return {
             "id": f"chatcmpl-{int(time.time())}",
@@ -356,7 +375,7 @@ async def openai_chat_completions(req: ChatCompletionRequest):
                 }
             ],
             "usage": {
-                "prompt_tokens": 0, # Calculation complex without tokenizer
+                "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0
             }

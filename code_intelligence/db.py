@@ -177,20 +177,16 @@ class Database:
                 cursor.execute('ALTER TABLE nodes ADD COLUMN git_sha TEXT')
                 cursor.execute('ALTER TABLE nodes ADD COLUMN repo_id TEXT DEFAULT "default"')
             except sqlite3.OperationalError:
-                # Columns might already exist if re-running partial migration
                 pass
 
             # Recreate FTS table to include new fields
             cursor.execute('DROP TABLE IF EXISTS nodes_fts')
-            # Note: We are not using content='nodes' because we want flexibility and direct control over FTS content
             cursor.execute('''
             CREATE VIRTUAL TABLE nodes_fts USING fts5(
                 id, name, content, filepath, next_route_path, next_segment_type, symbol_kind
             )
             ''')
 
-            # Re-populate FTS from existing nodes
-            # Note: we need to cast type to symbol_kind
             cursor.execute('''
             INSERT INTO nodes_fts (id, name, content, filepath, next_route_path, next_segment_type, symbol_kind)
             SELECT id, name, content, filepath, next_route_path, next_segment_type, type FROM nodes
@@ -225,7 +221,6 @@ class Database:
         )
         cursor.execute(sql, params)
         
-        # Update FTS
         cursor.execute('''
         INSERT OR REPLACE INTO nodes_fts (id, name, content, filepath, next_route_path, next_segment_type, symbol_kind)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -289,11 +284,6 @@ class Database:
         conn.close()
 
     def get_edges(self, node_id: str, direction: str = "out") -> List[Tuple[str, str]]:
-        """
-        Get edges connected to a node.
-        direction: 'out' (sources=node_id) or 'in' (targets=node_id)
-        Returns list of (neighbor_id, relationship)
-        """
         conn = self._get_conn()
         cursor = conn.cursor()
 
@@ -310,7 +300,6 @@ class Database:
         conn = self._get_conn()
         cursor = conn.cursor()
         
-        # Select all columns
         cursor.execute('''
             SELECT
                 id, type, name, filepath, start_line, end_line, content, properties,
@@ -402,15 +391,10 @@ class Database:
         conn.close()
 
     def search_nodes(self, query: str, limit: int = 10) -> List[CodeNode]:
-        """Full text search using FTS5."""
         conn = self._get_conn()
         cursor = conn.cursor()
         
         safe_query = query.replace('"', '""')
-        # We can eventually add field specific queries here if we want to boost columns
-        # e.g. "name:query^2 OR content:query"
-        # But for now basic MATCH is okay.
-
         try:
             cursor.execute(
                 '''
@@ -453,6 +437,26 @@ class Database:
         conn.commit()
         conn.close()
 
+    def upsert_embeddings_batch(self, embeddings: List[Tuple[str, List[float], str]]):
+        """Batch insert embeddings. List of (node_id, vector, model)"""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        data = []
+        for nid, vec, model in embeddings:
+            v_np = np.asarray(vec, dtype=np.float32)
+            data.append((nid, model, sqlite3.Binary(v_np.tobytes()), int(v_np.shape[0])))
+
+        cursor.executemany(
+            '''
+            INSERT OR REPLACE INTO embeddings (node_id, model, vector, dim)
+            VALUES (?, ?, ?, ?)
+            ''',
+            data
+        )
+        conn.commit()
+        conn.close()
+
     def get_embedding(self, node_id: str, model: str) -> Optional[np.ndarray]:
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -469,6 +473,55 @@ class Database:
         if dim and vec.shape[0] != dim:
             vec = vec[:dim]
         return vec
+
+    def get_chunks_without_embeddings(self, model: str) -> List[CodeNode]:
+        """Get nodes that do not have embeddings for the specified model."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        # We exclude 'file' type nodes if they are just containers,
+        # but often file summaries are useful. The 'file' type usually contains the whole file content.
+        # Let's exclude 'file' type to save tokens, as we chunk them into symbols/blocks.
+        # But wait, sometimes file summary is in 'file' node props.
+        # If the file is small, it's a chunk.
+
+        cursor.execute('''
+            SELECT
+                n.id, n.type, n.name, n.filepath, n.start_line, n.end_line, n.content, n.properties,
+                n.next_route_path, n.next_segment_type, n.next_use_client, n.next_use_server, n.next_is_route_handler,
+                n.next_runtime, n.import_deps, n.file_hash, n.git_sha, n.repo_id
+            FROM nodes n
+            LEFT JOIN embeddings e ON n.id = e.node_id AND e.model = ?
+            WHERE e.node_id IS NULL AND n.type != 'file'
+        ''', (model,))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        nodes = []
+        for row in rows:
+            import_deps = json.loads(row[14]) if row[14] else None
+            nodes.append(CodeNode(
+                id=row[0],
+                type=row[1],
+                name=row[2],
+                filepath=row[3],
+                start_line=row[4],
+                end_line=row[5],
+                content=row[6],
+                properties=json.loads(row[7]),
+                next_route_path=row[8],
+                next_segment_type=row[9],
+                next_use_client=bool(row[10]),
+                next_use_server=bool(row[11]),
+                next_is_route_handler=bool(row[12]),
+                next_runtime=row[13],
+                import_deps=import_deps,
+                file_hash=row[15],
+                git_sha=row[16],
+                repo_id=row[17]
+            ))
+        return nodes
 
     def get_file_hash(self, filepath: str) -> Optional[str]:
         conn = self._get_conn()
@@ -491,7 +544,6 @@ class Database:
     def get_all_nodes(self) -> List[CodeNode]:
         conn = self._get_conn()
         cursor = conn.cursor()
-        # Fetch all cols
         cursor.execute('''
             SELECT
                 id, type, name, filepath, start_line, end_line, content, properties,
@@ -527,7 +579,7 @@ class Database:
             ))
         return nodes
 
-    # --- Repo Map Methods (Unchanged mostly) ---
+    # --- Repo Map Methods ---
     def create_index_run(self, repo_root: str, config_hash: str) -> int:
         conn = self._get_conn()
         cursor = conn.cursor()

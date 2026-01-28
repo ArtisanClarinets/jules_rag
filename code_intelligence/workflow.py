@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -12,24 +13,20 @@ class BaseWorkflow:
         self.retriever = retriever
         self.llm = LLMInterface()
 
-    def execute(self, query: str) -> Dict[str, Any]:
+    async def execute(self, query: str) -> Dict[str, Any]:
         raise NotImplementedError
 
 class PlanWorkflow(BaseWorkflow):
-    def execute(self, query: str) -> Dict[str, Any]:
-        # 1. Broad Search
-        # We assume the query describes the feature.
+    async def execute(self, query: str) -> Dict[str, Any]:
         logger.info(f"Executing Plan Workflow for: {query}")
 
-        # Search with a higher K to get context
-        results = self.retriever.retrieve(query, k=20)
+        results = await self.retriever.retrieve(query, k=20)
 
         context_str = "\n\n".join([
             f"File: {r.node.filepath}\nContent:\n{r.node.content[:2000]}"
             for r in results
         ])
 
-        # 2. Generate Plan
         system_prompt = (
             "You are a Senior Software Architect. Create a comprehensive, corporate-level feature implementation plan.\n"
             "The plan should include:\n"
@@ -48,7 +45,8 @@ class PlanWorkflow(BaseWorkflow):
             "Generate the implementation plan in Markdown format."
         )
 
-        plan_content = self.llm.generate_response(
+        plan_content = await asyncio.to_thread(
+            self.llm.generate_response,
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=0.3,
@@ -67,10 +65,10 @@ class PlanWorkflow(BaseWorkflow):
         }
 
 class DocsWorkflow(BaseWorkflow):
-    def execute(self, query: str) -> Dict[str, Any]:
+    async def execute(self, query: str) -> Dict[str, Any]:
         logger.info(f"Executing Docs Workflow for: {query}")
 
-        results = self.retriever.retrieve(query, k=15)
+        results = await self.retriever.retrieve(query, k=15)
 
         context_str = "\n\n".join([
             f"File: {r.node.filepath}\nContent:\n{r.node.content[:3000]}"
@@ -89,7 +87,8 @@ class DocsWorkflow(BaseWorkflow):
             "Generate the documentation in Markdown format."
         )
 
-        docs_content = self.llm.generate_response(
+        docs_content = await asyncio.to_thread(
+            self.llm.generate_response,
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=0.2,
@@ -115,8 +114,8 @@ class WorkflowEngine:
             "DOCS": DocsWorkflow(retriever)
         }
 
-    def run(self, workflow_type: str, query: str) -> Optional[Dict[str, Any]]:
+    async def run(self, workflow_type: str, query: str) -> Optional[Dict[str, Any]]:
         wf = self.workflows.get(workflow_type)
         if wf:
-            return wf.execute(query)
+            return await wf.execute(query)
         return None

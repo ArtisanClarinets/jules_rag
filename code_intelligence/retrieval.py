@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass
@@ -34,61 +35,110 @@ class RetrievalEngine:
         # ANN Index
         self.ann_index = ANNIndex(os.path.join(os.path.dirname(settings.db_path), "vectors.bin"))
 
-    def retrieve(self, query: str, k: int = 10) -> List[SearchResult]:
+    async def retrieve(self, query: str, k: int = 10) -> List[SearchResult]:
         k = k or settings.retrieval_k
 
-        # 1. Sparse Search (FTS)
-        all_results: Dict[str, SearchResult] = {}
+        # 1. Query Expansion (Parallel)
+        expansion_tasks = [
+            self._decompose_query(query),
+            self._generate_hyde_doc(query)
+        ]
+        sub_questions, hyde_doc = await asyncio.gather(*expansion_tasks)
 
-        try:
-            sparse_nodes = self.db.search_nodes(query, limit=k*2)
-            for i, node in enumerate(sparse_nodes):
-                score = 1.0 / (i + 1)
-                all_results[node.id] = SearchResult(node, score, "sparse")
-        except Exception as e:
-            logger.error(f"Sparse search error: {e}")
+        if sub_questions:
+            logger.info(f"Decomposed query into: {sub_questions}")
+        if hyde_doc:
+            logger.info("Generated HyDE document.")
 
-        # 2. Dense Search (ANN / Brute)
+        queries_to_search = [query] + sub_questions
+
+        # 2. Search Execution (Parallel)
+
+        # Sparse Search
+        sparse_tasks = []
+        for q in queries_to_search:
+            sparse_tasks.append(asyncio.to_thread(self._sparse_search, q, k*2))
+
+        # Dense Search
+        dense_tasks = []
         if self.embeddings.client:
+            texts_to_embed = queries_to_search + ([hyde_doc] if hyde_doc else [])
             try:
-                q_vec = self.embeddings.embed([query])[0]
-                dense_hits = self._dense_search(q_vec, k=k*2)
+                # Embeddings API is IO bound, run in thread to avoid blocking loop if sync client
+                embeddings_list = await asyncio.to_thread(self.embeddings.embed, texts_to_embed)
 
-                for node, score in dense_hits:
-                    # Fusion (Simple CombSUM)
-                    if node.id in all_results:
-                        all_results[node.id].score += score
-                        all_results[node.id].reason = "hybrid"
-                    else:
-                        all_results[node.id] = SearchResult(node, score, "dense")
+                # Queries
+                for i in range(len(queries_to_search)):
+                    vec = embeddings_list[i]
+                    dense_tasks.append(asyncio.to_thread(self._dense_search, vec, k*2))
+
+                # HyDE
+                if hyde_doc:
+                    hyde_vec = embeddings_list[-1]
+                    dense_tasks.append(asyncio.to_thread(self._dense_search, hyde_vec, k*2))
+
             except Exception as e:
-                logger.warning(f"Dense search failed: {e}")
+                logger.error(f"Embedding failed: {e}")
 
-        candidates = list(all_results.values())
-        candidates.sort(key=lambda x: x.score, reverse=True)
-        candidates = candidates[:50]
+        # Await all
+        sparse_results_list = await asyncio.gather(*sparse_tasks)
+        dense_results_list = await asyncio.gather(*dense_tasks)
 
         # 3. Graph Expansion
-        expanded = self._expand_graph(candidates, limit=5)
-        existing_ids = {c.node.id for c in candidates}
-        for ex in expanded:
-            if ex.node.id not in existing_ids:
-                candidates.append(ex)
+        # Seed graph with top results from original query
+        seed_candidates = []
+        if sparse_results_list:
+            seed_candidates.extend(sparse_results_list[0][:5])
+        if dense_results_list:
+            seed_candidates.extend(dense_results_list[0][:5])
 
-        # Centrality Boosting
-        self._boost_centrality(candidates)
+        graph_results = await asyncio.to_thread(self._expand_graph, seed_candidates, 5)
 
-        candidates.sort(key=lambda x: x.score, reverse=True)
+        # 4. RRF Fusion
+        all_lists = sparse_results_list + dense_results_list + [graph_results]
+        fused_results = self._rrf_fusion(all_lists, k=60)
 
-        # 4. Rerank (LLM)
-        reranked = self._rerank(query, candidates[:20])
+        # 5. Rerank
+        top_candidates = fused_results[:20]
+        final_results = await self._rerank(query, top_candidates)
 
-        # 5. MMR Selection
-        final_results = self._mmr(self.embeddings.embed([query])[0] if self.embeddings.client else None, reranked, k)
+        return final_results[:k]
 
-        return final_results
+    async def _decompose_query(self, query: str) -> List[str]:
+        prompt = f"Decompose this complex query into 2-3 atomic sub-questions:\nQuery: {query}\n\nReturn JSON: {{'questions': ['q1', 'q2']}}"
+        try:
+            resp = await asyncio.to_thread(
+                self.llm.generate_response, prompt, system_prompt="You are a query assistant.", json_mode=True
+            )
+            data = json.loads(resp)
+            return data.get("questions", [])
+        except Exception:
+            return []
 
-    def _dense_search(self, vector: List[float], k: int) -> List[Tuple[CodeNode, float]]:
+    async def _generate_hyde_doc(self, query: str) -> str:
+        prompt = f"Write a hypothetical code snippet or documentation that answers this query:\nQuery: {query}\n\nCode/Doc:"
+        try:
+             return await asyncio.to_thread(
+                 self.llm.generate_response, prompt, temperature=0.0
+             )
+        except Exception:
+             return ""
+
+    def _sparse_search(self, query: str, limit: int) -> List[SearchResult]:
+        try:
+            nodes = self.db.search_nodes(query, limit=limit)
+            results = []
+            for i, node in enumerate(nodes):
+                # Normalize BM25? FTS doesn't give score easily in sqlite FTS5 via library wrappers usually
+                # standard rank
+                score = 1.0 / (i + 1)
+                results.append(SearchResult(node, score, "sparse"))
+            return results
+        except Exception as e:
+            logger.error(f"Sparse search error: {e}")
+            return []
+
+    def _dense_search(self, vector: List[float], k: int) -> List[SearchResult]:
         vec_np = np.array(vector, dtype=np.float32)
 
         if settings.retrieval_enable_ann and self.ann_index.available:
@@ -104,17 +154,16 @@ class RetrievalEngine:
                 for nid, score in hits:
                     node = self.db.get_node(nid)
                     if node:
-                        results.append((node, score))
+                        results.append(SearchResult(node, score, "dense"))
                 return results
 
         return self._brute_force_search(vec_np, k)
 
-    def _brute_force_search(self, vector: np.ndarray, k: int) -> List[Tuple[CodeNode, float]]:
+    def _brute_force_search(self, vector: np.ndarray, k: int) -> List[SearchResult]:
         self._refresh_cache_if_needed()
         if self._embeddings_cache_matrix is None:
             return []
 
-        # Ensure vector is normalized (OpenAI usually is)
         norm_v = np.linalg.norm(vector)
         if norm_v > 0:
             vector = vector / norm_v
@@ -132,7 +181,7 @@ class RetrievalEngine:
             nid = self._embeddings_cache_ids[idx]
             node = self.db.get_node(nid)
             if node:
-                results.append((node, float(scores[idx])))
+                results.append(SearchResult(node, float(scores[idx]), "dense"))
         return results
 
     def _refresh_cache_if_needed(self):
@@ -163,11 +212,6 @@ class RetrievalEngine:
         self._cache_timestamp = time.time()
 
     def _expand_graph(self, candidates: List[SearchResult], limit: int) -> List[SearchResult]:
-        """
-        Deep Graph Traversal:
-        1. Fetch definitions of types used in the function (uses_type).
-        2. Fetch callers of the function (calls).
-        """
         expanded = []
         seen = {c.node.id for c in candidates}
         seeds = candidates[:3]
@@ -177,14 +221,12 @@ class RetrievalEngine:
 
         try:
             for cand in seeds:
-                # Hop 1: Definitions of types used (outgoing edges)
                 cursor.execute("SELECT target_id FROM edges WHERE source_id = ? AND relationship = 'uses_type'", (cand.node.id,))
                 type_targets = [row[0] for row in cursor.fetchall()]
 
                 for target_id in type_targets:
                     if target_id.startswith("symbol:"):
                         type_name = target_id.split(":", 1)[1]
-                        # Find node defining this type
                         cursor.execute("SELECT id FROM nodes WHERE name = ? LIMIT 1", (type_name,))
                         row = cursor.fetchone()
                         if row:
@@ -195,8 +237,6 @@ class RetrievalEngine:
                                     expanded.append(SearchResult(node, cand.score * 0.4, f"defines-type:{type_name}"))
                                     seen.add(nid)
 
-                # Hop 2: Callers (incoming edges)
-                # target_id = symbol:<name>
                 symbol_id = f"symbol:{cand.node.name}"
                 cursor.execute("SELECT source_id FROM edges WHERE target_id = ? AND relationship = 'calls' LIMIT ?", (symbol_id, limit))
                 caller_ids = [row[0] for row in cursor.fetchall()]
@@ -215,103 +255,56 @@ class RetrievalEngine:
 
         return expanded
 
-    def _boost_centrality(self, candidates: List[SearchResult]):
-        """Boost score of nodes that are highly referenced (central)."""
-        conn = self.db._get_conn()
-        cursor = conn.cursor()
-        try:
-            for cand in candidates:
-                symbol_id = f"symbol:{cand.node.name}"
-                cursor.execute("SELECT COUNT(*) FROM edges WHERE target_id = ? AND relationship = 'calls'", (symbol_id,))
-                count = cursor.fetchone()[0]
-                if count > 0:
-                    # Logarithmic boost
-                    boost = 1.0 + (0.1 * np.log(1 + count))
-                    cand.score *= boost
-                    cand.reason += f" +centrality({count})"
-        except Exception:
-            pass
-        finally:
-            conn.close()
+    def _rrf_fusion(self, results_lists: List[List[SearchResult]], k: int = 60) -> List[SearchResult]:
+        scores = {}
+        node_map = {}
 
-    def _mmr(self, query_vec: Optional[np.ndarray], candidates: List[SearchResult], k: int) -> List[SearchResult]:
-        if query_vec is None or not candidates:
-            return candidates[:k]
+        for r_list in results_lists:
+            for rank, item in enumerate(r_list):
+                nid = item.node.id
+                if nid not in node_map:
+                    node_map[nid] = item.node
+                    scores[nid] = 0.0
 
-        lambda_param = settings.retrieval_mmr_lambda
-        selected = []
+                scores[nid] += 1.0 / (k + rank + 1)
 
-        # Prepare vectors for candidates
-        cand_vecs = []
-        cand_map = {}
+        fused = []
+        for nid, score in scores.items():
+            fused.append(SearchResult(node_map[nid], score, "rrf-fusion"))
 
-        if self._embeddings_cache_ids:
-             id_to_idx = {nid: i for i, nid in enumerate(self._embeddings_cache_ids)}
-             for c in candidates:
-                 if c.node.id in id_to_idx:
-                     cand_vecs.append(self._embeddings_cache_matrix[id_to_idx[c.node.id]])
-                     cand_map[len(cand_vecs)-1] = c
+        fused.sort(key=lambda x: x.score, reverse=True)
+        return fused
 
-        if not cand_vecs:
-            return candidates[:k]
+    async def _rerank(self, query: str, candidates: List[SearchResult]) -> List[SearchResult]:
+        if not candidates:
+            return []
 
-        cand_vecs = np.array(cand_vecs)
+        # Placeholder for CrossEncoder / TEI Reranker
+        # For now, we use a simple Heuristic + LLM Rerank if enabled
 
-        # Ensure normalization
-        norms = np.linalg.norm(cand_vecs, axis=1, keepdims=True)
-        cand_vecs = cand_vecs / (norms + 1e-9)
-
-        query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-9)
-
-        remaining_indices = list(range(len(cand_vecs)))
-
-        while len(selected) < k and remaining_indices:
-            best_score = -np.inf
-            best_idx = -1
-
-            for idx in remaining_indices:
-                sim_q = np.dot(cand_vecs[idx], query_vec)
-
-                if not selected:
-                    max_sim_s = 0
-                else:
-                    sims_s = [np.dot(cand_vecs[idx], cand_vecs[s_idx]) for s_idx in selected]
-                    max_sim_s = max(sims_s) if sims_s else 0
-
-                mmr_score = lambda_param * sim_q - (1 - lambda_param) * max_sim_s
-
-                if mmr_score > best_score:
-                    best_score = mmr_score
-                    best_idx = idx
-
-            if best_idx != -1:
-                selected.append(best_idx)
-                remaining_indices.remove(best_idx)
-
-        return [cand_map[i] for i in selected]
-
-    def _rerank(self, query: str, candidates: List[SearchResult]) -> List[SearchResult]:
-        # 1. Heuristic
-        query_terms = set(query.lower().split())
+        # 1. Heuristic Boost (Exact Match in path or content)
         for cand in candidates:
-            name_lower = cand.node.name.lower() if cand.node.name else ""
-            if any(term in name_lower for term in query_terms):
+            if query.lower() in cand.node.name.lower():
                 cand.score *= 1.2
-            if query in cand.node.content:
-                cand.score *= 1.5
+            if query.lower() in cand.node.filepath.lower():
+                cand.score *= 1.1
 
-        candidates.sort(key=lambda x: x.score, reverse=True)
-
-        # 2. LLM Rerank
-        top_candidates = candidates[:10]
-        if not top_candidates:
-            return candidates
+        # 2. LLM Rerank (Top 10)
+        top_slice = candidates[:10]
+        if not top_slice:
+             return candidates
 
         try:
-            reranked = self._llm_rerank(query, top_candidates)
-            return reranked + candidates[10:]
+             reranked_slice = await asyncio.to_thread(self._llm_rerank, query, top_slice)
+             # Combine
+             seen = {c.node.id for c in reranked_slice}
+             final = reranked_slice
+             for c in candidates:
+                 if c.node.id not in seen:
+                     final.append(c)
+             return final
         except Exception as e:
-            logger.warning(f"LLM Rerank failed: {e}")
+            logger.warning(f"Rerank failed: {e}")
             return candidates
 
     def _llm_rerank(self, query: str, candidates: List[SearchResult]) -> List[SearchResult]:
@@ -338,18 +331,13 @@ class RetrievalEngine:
             return candidates
 
         ranked_results = []
-        seen_indices = set()
 
-        for idx in indices:
+        for rank, idx in enumerate(indices):
             if isinstance(idx, int) and 0 <= idx < len(candidates):
                 c = candidates[idx]
-                c.score = 50.0 - (len(ranked_results) * 1.0)
+                # New score based on rank
+                c.score = 100.0 - (rank * 5.0)
                 c.reason = "llm-rerank"
-                ranked_results.append(c)
-                seen_indices.add(idx)
-
-        for i, c in enumerate(candidates):
-            if i not in seen_indices:
                 ranked_results.append(c)
 
         return ranked_results

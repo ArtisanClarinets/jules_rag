@@ -23,13 +23,11 @@ class TestIndexing(unittest.TestCase):
             f.write("def hello():\n    print('world')\n    return True\n")
 
         stats = self.indexer.index_workspace(self.test_dir)
-        # Note: Stats counts files, not nodes. 1 file processed.
-        # But wait, logic is: if res: stats["indexed"] += 1.
-        # And _process_file returns (should_index, entries).
-        # should_index is True for new file.
+        # 1 file processed
         self.assertEqual(stats["indexed"], 1)
 
-        nodes = self.db.get_nodes_by_filepath(filepath)
+        # Check using relative path
+        nodes = self.db.get_nodes_by_filepath("hello.py")
         self.assertTrue(len(nodes) >= 1) # File node + func node
 
         # Verify function extraction
@@ -43,7 +41,7 @@ class TestIndexing(unittest.TestCase):
             f.write("x = 1")
 
         self.indexer.index_workspace(self.test_dir)
-        hash1 = self.db.get_file_hash(filepath)
+        hash1 = self.db.get_file_hash("test.py")
 
         # Run again, should skip indexing but return stats
         stats = self.indexer.index_workspace(self.test_dir)
@@ -56,7 +54,7 @@ class TestIndexing(unittest.TestCase):
 
         stats = self.indexer.index_workspace(self.test_dir)
         self.assertEqual(stats["indexed"], 1)
-        hash2 = self.db.get_file_hash(filepath)
+        hash2 = self.db.get_file_hash("test.py")
         self.assertNotEqual(hash1, hash2)
 
     def test_ignore_rules(self):
@@ -74,7 +72,7 @@ class TestIndexing(unittest.TestCase):
         self.assertEqual(stats["indexed"], 1)
 
         # Verify ignore.js is NOT indexed
-        nodes = self.db.get_nodes_by_filepath(os.path.join(self.test_dir, "node_modules", "ignore.js"))
+        nodes = self.db.get_nodes_by_filepath("node_modules/ignore.js")
         self.assertEqual(len(nodes), 0)
 
 if __name__ == "__main__":
