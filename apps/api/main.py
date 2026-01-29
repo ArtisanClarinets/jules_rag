@@ -2,6 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apps.api.core.config import settings
 from apps.api.routers import health, tenants, query, ingestion, settings as settings_router
+from apps.api.core.database import Base, engine
+from apps.api.models import auth, config, ingestion as ingestion_model
+
+# Create tables
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=settings.PROJECT_NAME, openapi_url=f"{settings.API_V1_STR}/openapi.json")
 

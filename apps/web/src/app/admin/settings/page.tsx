@@ -1,32 +1,40 @@
 'use client'
 import { useState, useEffect } from 'react'
-import api from '@/lib/api'
+import api, { getSettings, updateSettings } from '@/lib/api'
 
 export default function SettingsPage() {
-  const [heapSize, setHeapSize] = useState('512m')
-  const [concurrency, setConcurrency] = useState(4)
+  const [settings, setSettings] = useState<Record<string, any>>({})
+  const [newKey, setNewKey] = useState('')
+  const [newValue, setNewValue] = useState('')
   const [status, setStatus] = useState('')
 
   useEffect(() => {
-      // Load settings
-      api.get('/api/v1/settings/').then(res => {
-          if (res.data.opensearch_heap) setHeapSize(res.data.opensearch_heap)
-          if (res.data.worker_concurrency) setConcurrency(res.data.worker_concurrency)
-      }).catch(console.error)
+      loadSettings()
   }, [])
+
+  const loadSettings = () => {
+      getSettings().then(res => setSettings(res)).catch(console.error)
+  }
 
   const handleSave = async () => {
       setStatus('Saving...')
       try {
-          await api.post('/api/v1/settings/', {
-              settings: {
-                  opensearch_heap: heapSize,
-                  worker_concurrency: concurrency
-              }
-          })
+          await updateSettings(settings)
           setStatus('Saved! Services restarting...')
       } catch (e) {
           setStatus('Error saving settings')
+      }
+  }
+
+  const handleUpdate = (key: string, value: string) => {
+      setSettings(prev => ({ ...prev, [key]: value }))
+  }
+
+  const handleAdd = () => {
+      if (newKey && newValue) {
+          setSettings(prev => ({ ...prev, [newKey]: newValue }))
+          setNewKey('')
+          setNewValue('')
       }
   }
 
@@ -35,32 +43,52 @@ export default function SettingsPage() {
         <h1 className="text-3xl font-bold">System Settings</h1>
 
         <div className="bg-card p-6 rounded border space-y-6">
-            <div>
-                <h3 className="font-semibold mb-2">OpenSearch Configuration</h3>
-                <div className="grid gap-4 max-w-md">
-                    <div>
-                        <label className="block text-sm font-medium mb-1">Heap Size</label>
-                        <input
-                            className="border p-2 rounded w-full"
-                            value={heapSize}
-                            onChange={e => setHeapSize(e.target.value)}
-                        />
-                    </div>
-                </div>
+            <h3 className="font-semibold mb-2">Configuration</h3>
+
+            <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left">
+                    <thead className="bg-muted text-muted-foreground">
+                        <tr>
+                            <th className="p-2">Key</th>
+                            <th className="p-2">Value</th>
+                            <th className="p-2">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {Object.entries(settings).map(([key, value]) => (
+                            <tr key={key} className="border-b">
+                                <td className="p-2 font-mono">{key}</td>
+                                <td className="p-2">
+                                    <input
+                                        className="border p-1 rounded w-full"
+                                        value={value as string}
+                                        onChange={e => handleUpdate(key, e.target.value)}
+                                    />
+                                </td>
+                                <td className="p-2">
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
             </div>
 
-            <div className="border-t pt-6">
-                <h3 className="font-semibold mb-2">Service Resources</h3>
-                <div className="grid gap-4 max-w-md">
-                    <div>
-                        <label className="block text-sm font-medium mb-1">Worker Concurrency</label>
-                        <input
-                            type="number"
-                            className="border p-2 rounded w-full"
-                            value={concurrency}
-                            onChange={e => setConcurrency(parseInt(e.target.value))}
-                        />
-                    </div>
+            <div className="border-t pt-4">
+                <h4 className="font-medium mb-2">Add New Setting</h4>
+                <div className="flex gap-2">
+                    <input
+                        className="border p-2 rounded flex-1"
+                        placeholder="Key"
+                        value={newKey}
+                        onChange={e => setNewKey(e.target.value)}
+                    />
+                    <input
+                        className="border p-2 rounded flex-1"
+                        placeholder="Value"
+                        value={newValue}
+                        onChange={e => setNewValue(e.target.value)}
+                    />
+                    <button onClick={handleAdd} className="bg-secondary text-secondary-foreground px-4 py-2 rounded">Add</button>
                 </div>
             </div>
 
